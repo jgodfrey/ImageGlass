@@ -39,7 +39,7 @@ namespace ImageGlass {
     /// to a resolution of 15ms.  Call setTickInMilliseconds to ask for a different rate, which
     /// sets the fastest tick allowed for all HighResolutionAnimators. </p>
     /// </summary>
-    public class HighResolutionGifAnimator : GifAnimator {
+    public class HighResolutionGifAnimator: GifAnimator {
         #region STATIC 
         private static int ourMinTickTimeInMilliseconds;
         private static readonly ConcurrentDictionary<Image, GifImageData> ourImageState;
@@ -173,10 +173,16 @@ namespace ImageGlass {
         // image lock should be held
         //
         private bool ImageHasTimeFrames(Image image) {
-            foreach (Guid guid in image.FrameDimensionsList) {
-                FrameDimension dimension = new FrameDimension(guid);
-                if (dimension.Equals(FrameDimension.Time))
-                    return image.GetFrameCount(FrameDimension.Time) > 1;
+            try {
+                foreach (Guid guid in image.FrameDimensionsList) {
+                    if (guid == FrameDimension.Time.Guid)
+                        return image.GetFrameCount(FrameDimension.Time) > 1;
+                }
+            }
+            catch {
+                // fire-eggs 20191114 fix observed issue: if pounding heavily CTRL+Space (to
+                // toggle GIF animation) _while_ playing a slideshow, there is a window of
+                // time where the image could be invalid. This manifested as an exception here.
             }
 
             return false;
@@ -184,6 +190,7 @@ namespace ImageGlass {
 
         private class GifImageData {
             private static readonly int FrameDelayTag = 0x5100;
+            private static readonly int LoopCountTag = 20737;
 
             // image is used for identification in map
             //
@@ -195,6 +202,10 @@ namespace ImageGlass {
             private readonly int[] myFrameDelaysInCentiseconds;
             public bool myIsDirty;
             private int myCurrentFrame;
+
+            // KBR 20190614 respect the GIF loop count value
+            private int maxLoopCount;
+            private int currentLoopCount;
 
             // image should be locked by caller
             //
@@ -210,6 +221,8 @@ namespace ImageGlass {
                 myCurrentFrame = 0;
                 myIsDirty = false;
                 myOnFrameChangedHandler = onFrameChangedHandler;
+                maxLoopCount = BitConverter.ToInt16(image.GetPropertyItem(LoopCountTag).Value, 0);
+                currentLoopCount = 0;
             }
 
             public bool ThreadIsNotDead() {
@@ -217,7 +230,17 @@ namespace ImageGlass {
             }
 
             public void HandleUpdateTick() {
-                myCurrentFrame = (myCurrentFrame + 1) % myNumFrames;
+                // KBR 20190614 Loop through frames, respecting the max loop count
+                myCurrentFrame++;
+                if (myCurrentFrame >= myNumFrames) {
+                    myCurrentFrame = 0;
+                    currentLoopCount++;
+
+                    if (maxLoopCount > 0 && currentLoopCount >= maxLoopCount) {
+                        myIsThreadDead = 1;
+                        return;
+                    }
+                }
                 myIsDirty = true;
                 myOnFrameChangedHandler(myImage, EventArgs.Empty);
             }

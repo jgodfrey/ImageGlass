@@ -1,6 +1,6 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
-Copyright (C) 2019 DUONG DIEU PHAP
+Copyright (C) 2021 DUONG DIEU PHAP
 Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
@@ -22,19 +22,16 @@ using System.Threading.Tasks;
 /// <summary>
 /// Application to perform Windows 8/10 specific operations.
 /// These require using Windows 8/10 DLLs which aren't available
-/// on Windows 7. [... and would cause igcmd to crash on Win7 if 
+/// on Windows 7. [... and would cause igcmd to crash on Win7 if
 /// the references were added to that project]
 /// </summary>
-namespace igcmdWin10
-{
-    class Program
-    {
+namespace igcmdWin10 {
+    internal static class Program {
         [STAThread]
-        static int Main(string[] args)
-        {
-            string topcmd = args[0].ToLower().Trim();
-            if (topcmd == "setlockimage")
-            {
+        private static int Main(string[] args) {
+            var topcmd = args[0].ToLower().Trim();
+
+            if (topcmd == "setlockimage") {
                 var task = SetLockScreenImageAsync(args);
                 task.Wait();
 
@@ -44,19 +41,16 @@ namespace igcmdWin10
             return 0;
         }
 
-
         /// <summary>
         /// Set lock screen image
         /// </summary>
         /// <param name="args"></param>
         /// <returns></returns>
-        internal static async Task<int> SetLockScreenImageAsync(string[] args)
-        {
-            string imgPath = args[1];
-            var result = await LockScreenImage.SetAsync(imgPath);
-            
+        internal static async Task<int> SetLockScreenImageAsync(string[] args) {
+            var imgPath = args[1];
+            var result = await LockScreenImage.SetAsync(imgPath).ConfigureAwait(true);
+
             return result;
         }
-
     }
 }

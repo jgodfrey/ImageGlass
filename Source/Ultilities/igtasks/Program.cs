@@ -1,6 +1,6 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
-Copyright (C) 2019 DUONG DIEU PHAP
+Copyright (C) 2021 DUONG DIEU PHAP
 Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
@@ -16,16 +16,14 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
-using System;
-using System.Windows.Forms;
 using igtasks;
 using ImageGlass.Library.Image;
-using ImageGlass.Services.Configuration;
+using ImageGlass.Settings;
+using System;
+using System.Windows.Forms;
 
-namespace adtasks
-{
-    static class Program
-    {
+namespace adtasks {
+    internal static class Program {
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
@@ -38,8 +36,7 @@ namespace adtasks
         /// The main entry point for the application.
         /// </summary>
         [STAThread]
-        private static int Main(string[] argv)
-        {
+        private static int Main(string[] argv) {
             // Windows Vista or later
             if (Environment.OSVersion.Version.Major >= 6)
                 SetProcessDPIAware();
@@ -49,23 +46,20 @@ namespace adtasks
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // Check if the start up directory writable
-            GlobalSetting.IsStartUpDirWritable = GlobalSetting.CheckStartUpDirWritable();
+            // Load user configs
+            Configs.Load();
 
-            //Command
-            string topcmd = args[0].ToLower().Trim();
+            // Command
+            var topcmd = args[0].ToLower().Trim();
 
-
-            //Set desktop wallpaper
+            // Set desktop wallpaper
             #region setwallpaper <string imgPath> [int style]
-            if (topcmd == "setwallpaper")
-            {
+            if (topcmd == "setwallpaper") {
                 //Get image's path
-                string imgPath = args[1];
+                var imgPath = args[1];
                 var style = DesktopWallapaper.Style.Current;
 
-                if (args.Length > 2)
-                {
+                if (args.Length > 2) {
                     //Get style
                     Enum.TryParse(args[2], out style);
                 }
@@ -75,65 +69,63 @@ namespace adtasks
             }
             #endregion
 
-
-            //Register file associations
+            // Register file associations
             #region regassociations <string exts>
-            else if (topcmd == "regassociations")
-            {
+            else if (topcmd == "regassociations") {
                 //get Extensions
-                string exts = args[1];
+                var exts = args[1];
 
                 return Functions.SetRegistryAssociations(exts);
             }
             #endregion
 
-
-            //Delete all file associations
+            // Delete all file associations
             #region delassociations
-            else if (topcmd == "delassociations")
-            {
-                return Functions.DeleteRegistryAssociations(GlobalSetting.AllImageFormats, true);
-                
+            else if (topcmd == "delassociations") {
+                var formats = Configs.GetImageFormats(Configs.AllFormats);
+                return Functions.DeleteRegistryAssociations(formats, true);
             }
             #endregion
 
-
-            //Install new language packs
+            // Install new language packs
             #region iginstalllang
-            else if (topcmd == "iginstalllang")
-            {
+            else if (topcmd == "iginstalllang") {
                 Functions.InstallLanguagePacks();
             }
             #endregion
 
-
-            //Create new language packs
+            // Create new language packs
             #region ignewlang
-            else if (topcmd == "ignewlang")
-            {
+            else if (topcmd == "ignewlang") {
                 Functions.CreateNewLanguagePacks();
             }
             #endregion
 
-
-            //Edit language packs
+            // Edit language packs
             #region igeditlang <string filename>
-            else if (topcmd == "igeditlang")
-            {
+            else if (topcmd == "igeditlang") {
                 //get Executable file
-                string filename = args[1];
+                var filename = args[1];
 
                 Functions.EditLanguagePacks(filename);
             }
             #endregion
-            
 
+            // Register URI Scheme for Web-to-App linking
+            #region reg-uri-scheme
+            else if (topcmd == "reg-uri-scheme") {
+                return Functions.SetURIScheme();
+            }
+            #endregion
 
+            // Delete URI Scheme registry
+            #region del-uri-scheme
+            else if (topcmd == "del-uri-scheme") {
+                return Functions.DeleteURIScheme();
+            }
+            #endregion
 
             return 0;
         }
-
-
-
     }
 }

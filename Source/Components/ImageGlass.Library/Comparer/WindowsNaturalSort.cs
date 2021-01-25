@@ -1,7 +1,7 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
-Copyright (C) 2017 DUONG DIEU PHAP
-Project homepage: http://imageglass.org
+Copyright (C) 2017-2019 DUONG DIEU PHAP
+Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -17,27 +17,32 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Security;
 
-namespace ImageGlass.Library.Comparer
-{
-    public class WindowsNaturalSort : IComparer<string>
-    {
+namespace ImageGlass.Library.Comparer {
+    public class WindowsNaturalSort: IComparer<string> {
         [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
-        static extern int StrCmpLogicalW(String x, String y);
+        private static extern int StrCmpLogicalW(string x, string y);
 
-        public int Compare(string filePath1, string filePath2)
-        {
+        public int Compare(string filePath1, string filePath2) {
             var basename1 = Path.GetFileName(filePath1);
             var basename2 = Path.GetFileName(filePath2);
 
             return StrCmpLogicalW(basename1, basename2);
         }
-        
     }
-    
+
+    public class ReverseWindowsNaturalSort: IComparer<string> {
+        [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int StrCmpLogicalW(string x, string y);
+
+        public int Compare(string filePath1, string filePath2) {
+            var basename1 = Path.GetFileName(filePath2);
+            var basename2 = Path.GetFileName(filePath1);
+
+            return StrCmpLogicalW(basename1, basename2);
+        }
+    }
 }

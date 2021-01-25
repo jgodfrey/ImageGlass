@@ -1,6 +1,6 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
-Copyright (C) 2019 DUONG DIEU PHAP
+Copyright (C) 2021 DUONG DIEU PHAP
 Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
@@ -19,66 +19,75 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Linq;
-using System.Drawing;
-using System.Windows.Forms;
-using ImageGlass.Core;
-using ImageGlass.Library.Image;
-using ImageGlass.Library.Comparer;
-using System.IO;
-using System.Diagnostics;
-using ImageGlass.Services.Configuration;
-using ImageGlass.Library;
 using System.Collections.Specialized;
-using ImageGlass.Services.InstanceManagement;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
-using ImageGlass.Theme;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
-using ImageGlass.Library.WinAPI;
-using System.Collections.Concurrent;
+using System.Windows.Forms;
 using FileWatcherEx;
+using ImageGlass.Base;
+using ImageGlass.Library;
+using ImageGlass.Library.Comparer;
+using ImageGlass.Library.Image;
+using ImageGlass.Library.WinAPI;
+using ImageGlass.Services;
+using ImageGlass.Services.InstanceManagement;
+using ImageGlass.Settings;
+using ImageGlass.UI;
+using ImageGlass.UI.Renderers;
+using ImageGlass.UI.ToolForms;
+using ImageMagick;
 
-namespace ImageGlass
-{
-    public partial class frmMain : Form
-    {
-        public frmMain()
-        {
+namespace ImageGlass {
+    public partial class frmMain: Form {
+        public frmMain() {
             InitializeComponent();
 
-            //Get DPI Scaling ratio
-            //NOTE: the this.DeviceDpi property is not accurate
+            // Get DPI Scaling ratio
+            // NOTE: the this.DeviceDpi property is not accurate
             DPIScaling.CurrentDPI = DPIScaling.GetSystemDpi();
 
-            //Remove white line under tool strip
-            toolMain.Renderer = new Theme.ToolStripRenderer();
 
-            //Load UI Configs
+            // Load UI Configs
             LoadConfig(isLoadUI: true, isLoadOthers: false);
 
-            //Update form with new DPI
+            // Update form with new DPI
             OnDpiChanged();
             Application.DoEvents();
 
-            /* KBR 20181009 - Fix observed bug. 
-             * If picMain had input focus, CTRL+/CTRL- keys would zoom *twice*. 
-             * This is disabled by turning off ImageBox shortcuts. 
-             * Done here rather than in designer so this bugfix is visible.
-             */
+            // Disable built-in shortcuts
             picMain.ShortcutsEnabled = false;
 
+            // Fix disk thrashing
+            thumbnailBar.MetadataCacheEnabled = false;
+
+            _isWindows10 = Environment.OSVersion.Version.Major >= 10;
         }
-        
 
 
         #region Local variables
 
         // window size value before resizing
-        private Size _windowSize = new Size(1000, 800);
+        private Size _windowSize = new(1300, 800);
+
+        // window state value before resizing
+        private FormWindowState _windowState = FormWindowState.Minimized;
 
         // determine if the image is zoomed
-        private bool _isManuallyZoomed = false;
+        private bool _isManuallyZoomed;
+
+        // determine if window is frameless (fullscreen / slideshow)
+        private bool _isFrameless;
+
+        // determine if is WindowFit (fullscreen / slideshow)
+        private bool _isWindowFit;
 
         // determine if toolbar is shown (fullscreen / slideshow)
         private bool _isShowToolbar = true;
@@ -87,90 +96,103 @@ namespace ImageGlass
         private bool _isShowThumbnail = true;
 
         // determine if Windows key is pressed
-        private bool _isWindowsKeyPressed = false;
+        private bool _isWindowsKeyPressed;
 
         // determine if user is dragging an image file
-        private bool _isDraggingImage = false;
+        private bool _isDraggingImage;
 
         // gets, sets wheather the app is busy or not
-        private bool _isAppBusy = false;
+        private bool _isAppBusy;
 
+        // slideshow countdown interval
+        private uint _slideshowCountdown = 5;
+
+        private readonly ToolFormManager _toolManager = new();
+
+        private MovableForm _movableForm;
 
         // gets, sets the CancellationTokenSource of synchronious image loading task
-        private System.Threading.CancellationTokenSource _cancelToken = new System.Threading.CancellationTokenSource();
-
+        private System.Threading.CancellationTokenSource _cancelToken = new();
 
         /***********************************
          * Variables for FileWatcherEx
          ***********************************/
         // the list of local deleted files, need to be deleted in the memory list
-        private List<string> _queueListForDeleting = new List<string>();
+        private readonly List<string> _queueListForDeleting = new();
 
         // File system watcher
-        private FileWatcherEx.FileWatcherEx _fileWatcher = new FileWatcherEx.FileWatcherEx();
+        private FileWatcherEx.FileWatcherEx _fileWatcher = new();
+
+        private readonly bool _isWindows10;
 
         #endregion
 
 
-
         #region Drag - drop
-        private void picMain_DragOver(object sender, DragEventArgs e)
-        {
-            string filePath = ((string[])e.Data.GetData(DataFormats.FileDrop))[0];
+        private void picMain_DragOver(object sender, DragEventArgs e) {
+            try {
+                if (!e.Data.GetDataPresent(DataFormats.FileDrop))
+                    return;
+                var dataTest = e.Data.GetData(DataFormats.FileDrop, false);
+                if (dataTest == null) // observed: null w/ long path and long path support not enabled
+                    return;
 
-            // Drag file from DESKTOP to APP
-            if (GlobalSetting.ImageList.IndexOf(filePath) == -1)
-            {
-                e.Effect = DragDropEffects.Move;
+                var filePath = ((string[])dataTest)[0];
+
+                // KBR 20190617 Fix observed issue: dragging from CD/DVD would fail because we set the
+                // drag effect to Move, which is _not_allowed_
+                // Drag file from DESKTOP to APP
+                if (Local.ImageList.IndexOf(filePath) == -1 &&
+                    (e.AllowedEffect & DragDropEffects.Move) != 0) {
+                    e.Effect = DragDropEffects.Move;
+                }
+                // Drag file from APP to DESKTOP
+                else {
+                    e.Effect = DragDropEffects.Copy;
+                }
             }
-            // Drag file from APP to DESKTOP
-            else
-            {
-                e.Effect = DragDropEffects.Copy;
+            catch {
+                // observed: exception with a long path and long path support enabled
             }
         }
 
-        private void picMain_DragDrop(object sender, DragEventArgs e)
-        {
+        private void picMain_DragDrop(object sender, DragEventArgs e) {
             // Drag file from DESKTOP to APP
-            string[] filepaths = ((string[])e.Data.GetData(DataFormats.FileDrop));
-            if (filepaths.Length > 1)
-            {
-                PrepareMulti(filepaths);
+            if (!e.Data.GetDataPresent(DataFormats.FileDrop))
+                return;
+            var filepaths = ((string[])e.Data.GetData(DataFormats.FileDrop, false));
+
+            if (filepaths.Length > 1) {
+                _ = PrepareLoadingAsync(filepaths, Local.ImageList.GetFileName(Local.CurrentIndex));
                 return;
             }
 
-            string filePath = filepaths[0];
+            var filePath = filepaths[0];
 
-            if (Path.GetExtension(filePath).ToLower() == ".lnk")
-                filePath = Shortcuts.FolderFromShortcut(filePath);
+            if (string.Equals(Path.GetExtension(filePath), ".lnk", StringComparison.CurrentCultureIgnoreCase))
+                filePath = Shortcuts.GetTargetPathFromShortcut(filePath);
 
-            int imageIndex = GlobalSetting.ImageList.IndexOf(filePath);
+            var imageIndex = Local.ImageList.IndexOf(filePath);
 
             // The file is located another folder, load the entire folder
-            if (imageIndex == -1)
-            {
-                Prepare(filePath);
+            if (imageIndex == -1) {
+                PrepareLoading(filePath);
             }
             // The file is in current folder AND it is the viewing image
-            else if (GlobalSetting.CurrentIndex == imageIndex)
-            {
+            else if (Local.CurrentIndex == imageIndex) {
                 //do nothing
             }
             // The file is in current folder AND it is NOT the viewing image
-            else
-            {
-                GlobalSetting.CurrentIndex = imageIndex;
-                NextPic(0);
+            else {
+                Local.CurrentIndex = imageIndex;
+                _ = NextPicAsync(0);
             }
         }
 
-        private void picMain_MouseDown(object sender, MouseEventArgs e)
-        {
-            if (_isDraggingImage)
-            {
-                string[] paths = new string[1];
-                paths[0] = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+        private void picMain_MouseDown(object sender, MouseEventArgs e) {
+            if (_isDraggingImage) {
+                var paths = new string[1];
+                paths[0] = Local.ImageList.GetFileName(Local.CurrentIndex);
 
                 var data = new DataObject(DataFormats.FileDrop, paths);
                 picMain.DoDragDrop(data, DragDropEffects.Copy);
@@ -178,115 +200,150 @@ namespace ImageGlass
                 _isDraggingImage = false;
             }
         }
-        
-        #endregion
 
+        #endregion
 
 
         #region Preparing image
         /// <summary>
         /// Open an image
         /// </summary>
-        private void OpenFile()
-        {
-            OpenFileDialog o = new OpenFileDialog();
-            o.Filter = GlobalSetting.LangPack.Items["frmMain._OpenFileDialog"] + "|" +
-                        GlobalSetting.AllImageFormats;
-
-            if (o.ShowDialog() == DialogResult.OK && File.Exists(o.FileName))
-            {
-                Prepare(o.FileName);
+        private void OpenFile() {
+            var formats = Configs.GetImageFormats(Configs.AllFormats);
+            using var o = new OpenFileDialog() {
+                Filter = Configs.Language.Items[$"{Name}._OpenFileDialog"] + "|" +
+                        formats,
+                CheckFileExists = true,
+            };
+            if (o.ShowDialog() == DialogResult.OK) {
+                _ = PrepareLoadingAsync(o.FileNames, o.FileNames[0]);
             }
-            o.Dispose();
         }
 
         /// <summary>
-        /// Prepare to load image
+        /// Prepare to load images. This method invoked for image on the command line,
+        /// i.e. when double-clicking an image.
         /// </summary>
-        /// <param name="path">Initial file/folder to load with</param>
-        /// <param name="targetImgFile">When re-loading the image list, this is the desired image to remain visible</param>
-        public async void Prepare(string path, string targetImgFile = null)
-        {
-            System.Threading.SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+        /// <param name="inputPath">The relative/absolute path of file/folder; or a URI Scheme</param>
+        private void PrepareLoading(string inputPath) {
+            var path = App.ToAbsolutePath(inputPath);
+            var currentFileName = File.Exists(path) ? path : "";
 
-            if (File.Exists(path) == false && Directory.Exists(path) == false)
-                return;
-
-            //Stopwatch stopwatch = Stopwatch.StartNew();
-
-            //Reset current index
-            GlobalSetting.CurrentIndex = 0;
-            string filePath = "";
-            string dirPath = "";
-            var _imageFilenameList = new List<string>();
-
-            await Task.Run(() =>
-            {
-
-                //Check path is file or directory?
-                if (File.Exists(path))
-                {
-                    if (Path.GetExtension(path).ToLower() == ".lnk")
-                        dirPath = Shortcuts.FolderFromShortcut(path);
-                    else
-                        dirPath = Path.GetDirectoryName(path);
-
-                    filePath = path;
-                }
-                else if (Directory.Exists(path))
-                {
-                    dirPath = path;
-                }
-
-
-                // Issue #415: If the folder name ends in ALT+255 (alternate space), DirectoryInfo strips it.
-                // By ensuring a terminating slash, the problem disappears. By doing that *here*,
-                // the uses of DirectoryInfo in DirectoryFinder and FileWatcherEx are fixed as well.
-                // https://stackoverflow.com/questions/5368054/getdirectories-fails-to-enumerate-subfolders-of-a-folder-with-255-name
-                if (!dirPath.EndsWith(Path.DirectorySeparatorChar.ToString()))
-                    dirPath += Path.DirectorySeparatorChar;
-
-
-                LocalSetting.InitialInputImageFilename = string.IsNullOrEmpty(filePath) ? dirPath : filePath;
-
-                //Get supported image extensions from directory
-                _imageFilenameList = LoadImageFilesFromDirectory(dirPath);
-
-            });
-
-
-
-            //stopwatch.Stop();
-            //Console.WriteLine(">>>>>> Loading time of folder = " + stopwatch.ElapsedMilliseconds);
-
-
-            LoadImages(_imageFilenameList, targetImgFile ?? filePath);
-
-            WatchPath(dirPath);
+            // Start loading path
+            _ = PrepareLoadingAsync(new string[] { inputPath }, currentFileName);
         }
-        
+
+        /// <summary>
+        /// Prepare to load images
+        /// </summary>
+        /// <param name="inputPaths">Paths of image files or folders. It can be relative/absolute paths or URI Scheme</param>
+        /// <param name="currentFileName">Current viewing filename</param>
+        private async Task PrepareLoadingAsync(IEnumerable<string> inputPaths, string currentFileName = "") {
+            System.Threading.SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+            if (!inputPaths.Any()) return;
+
+            var allFilesToLoad = new HashSet<string>();
+            var currentFile = currentFileName;
+            var hasInitFile = !string.IsNullOrEmpty(currentFile);
+
+            // Display currentFile while loading the full directory
+            if (hasInitFile) {
+                _ = NextPicAsync(0, filename: currentFile);
+            }
+
+            // Parse string to absolute path
+            var paths = inputPaths.Select(item => App.ToAbsolutePath(item));
+
+            // prepare the distinct dir list
+            var distinctDirsList = Helper.GetDistinctDirsFromPaths(paths);
+
+            // track paths loaded to prevent duplicates
+            var pathsLoaded = new HashSet<string>();
+            var firstPath = true;
+
+            var sortedFilesList = new List<string>();
+
+            await Task.Run(() => {
+                foreach (var apath in distinctDirsList) {
+                    var dirPath = apath;
+                    if (File.Exists(apath)) {
+                        if (string.Equals(Path.GetExtension(apath), ".lnk", StringComparison.CurrentCultureIgnoreCase)) {
+                            dirPath = Shortcuts.GetTargetPathFromShortcut(apath);
+                        }
+                        else {
+                            dirPath = Path.GetDirectoryName(apath);
+                        }
+                    }
+                    else if (Directory.Exists(apath)) {
+                        // Issue #415: If the folder name ends in ALT+255 (alternate space), DirectoryInfo strips it.
+                        // By ensuring a terminating slash, the problem disappears. By doing that *here*,
+                        // the uses of DirectoryInfo in DirectoryFinder and FileWatcherEx are fixed as well.
+                        // https://stackoverflow.com/questions/5368054/getdirectories-fails-to-enumerate-subfolders-of-a-folder-with-255-name
+                        if (!apath.EndsWith(Path.DirectorySeparatorChar.ToString())) {
+                            dirPath = apath + Path.DirectorySeparatorChar;
+                        }
+                    }
+                    else {
+                        continue;
+                    }
+
+                    // TODO: Currently only have the ability to watch a single path for changes!
+                    if (firstPath) {
+                        firstPath = false;
+                        WatchPath(dirPath);
+
+                        // Seek for explorer sort order
+                        DetermineSortOrder(dirPath);
+                    }
+
+                    // KBR 20181004 Fix observed bug: dropping multiple files from the same path
+                    // would load ALL files in said path multiple times! Prevent loading the same
+                    // path more than once.
+                    if (pathsLoaded.Contains(dirPath))
+                        continue;
+
+                    pathsLoaded.Add(dirPath);
+
+                    var imageFilenameList = LoadImageFilesFromDirectory(dirPath);
+                    allFilesToLoad.UnionWith(imageFilenameList);
+                }
+
+                Local.InitialInputPath = hasInitFile ? (distinctDirsList.Count > 0 ? distinctDirsList[0] : "") : currentFile;
+
+                // sort list
+                sortedFilesList = SortImageList(allFilesToLoad);
+
+            }).ConfigureAwait(true);
+
+            LoadImages(sortedFilesList, currentFile, skipLoadingImage: hasInitFile);
+        }
 
         /// <summary>
         /// Load the images.
         /// </summary>
-        /// <param name="_imageFilenameList"></param>
-        /// <param name="filePath"></param>
-        private void LoadImages(List<string> _imageFilenameList, string filePath)
-        { 
-            //Dispose all garbage
-            GlobalSetting.ImageList.Dispose();
+        /// <param name="imageFilenameList">The list of files to load</param>
+        /// <param name="filePath">The image file path to view first</param>
+        private void LoadImages(List<string> imageFilenameList, string filePath, bool skipLoadingImage = false) {
+            // Dispose all garbage
+            Local.ImageList.Dispose();
 
-            //Set filename to image list
-            GlobalSetting.ImageList = new ImgMan(_imageFilenameList.ToArray());
+            // Set filename to image list
+            Local.ImageList = new Heart.Factory(imageFilenameList) {
+                MaxQueue = Configs.ImageBoosterCachedCount,
+                Channels = (int)Local.Channels,
+            };
 
+            // Track image loading progress
+            Local.ImageList.OnFinishLoadingImage += ImageList_OnFinishLoadingImage;
 
-            //Track image loading progress
-            GlobalSetting.ImageList.OnFinishLoadingImage += ImageList_OnFinishLoadingImage;
+            // Find the index of current image
+            if (filePath.Length > 0) {
+                // this part of code fixes calls on legacy 8.3 filenames
+                // (for example opening files from IBM Notes)
+                var di = new DirectoryInfo(filePath);
+                filePath = di.FullName;
 
-            //Find the index of current image
-            if (filePath.Length > 0)
-            {
-                GlobalSetting.CurrentIndex = GlobalSetting.ImageList.IndexOf(filePath);
+                Local.CurrentIndex = Local.ImageList.IndexOf(filePath);
 
                 // KBR 20181009 Changing "include subfolder" setting could lose the "current" image.
                 // Prefer not to report said image is "corrupt", merely reset the index in that case.
@@ -295,157 +352,84 @@ namespace ImageGlass
                 // 3. Change setting "include subfolders: OFF".
                 // Issue: the image in the subfolder is attempted to be shown, declared as corrupt/missing.
                 // Issue #481: the test is incorrect when imagelist is empty (i.e. attempt to open single, hidden image with 'show hidden' OFF)
-                if (GlobalSetting.CurrentIndex == -1 && 
-                    GlobalSetting.ImageList.Length > 0 &&
-                    !GlobalSetting.ImageList.HasFolder(filePath))
-                    GlobalSetting.CurrentIndex = 0;
+                if (Local.CurrentIndex == -1 &&
+                    Local.ImageList.Length > 0 &&
+                    !Local.ImageList.ContainsDirPathOf(filePath)) {
+                    Local.CurrentIndex = 0;
+                }
             }
-            else
-            {
-                GlobalSetting.CurrentIndex = 0;
+            else {
+                Local.CurrentIndex = 0;
             }
 
-            //Load thumnbnail
+            // Load thumnbnail
             LoadThumbnails();
 
-            //Cannot find the index
-            if (GlobalSetting.CurrentIndex == -1)
-            {
-                //Mark as Image Error
-                GlobalSetting.IsImageError = true;
-                this.Text = $"{Application.ProductName} - {Path.GetFileName(filePath)} - {ImageInfo.GetFileSize(filePath)}";
 
-                picMain.Text = GlobalSetting.LangPack.Items["frmMain.picMain._ErrorText"];
-                picMain.Image = null;
-
-                //Exit function
-                return;
+            if (!skipLoadingImage) {
+                // Start loading image
+                _ = NextPicAsync(0);
             }
 
-            //Start loading image
-            NextPic(0);
+            SetStatusBar();
         }
-
 
         /// <summary>
         /// Watch a folder for changes.
         /// </summary>
         /// <param name="dirPath">The path to the folder to watch.</param>
-        private void WatchPath(string dirPath)
-        {
+        private void WatchPath(string dirPath) {
+            // From Issue #530: file watcher currently fails nastily if given a prefixed path
+            var pathToWatch = Heart.Helpers.DePrefixLongPath(dirPath);
+
             //Watch all changes of current path
-            this._fileWatcher.Stop();
-            this._fileWatcher = new FileWatcherEx.FileWatcherEx()
-            {
-                FolderPath = dirPath,
-                IncludeSubdirectories = GlobalSetting.IsRecursiveLoading,
+            _fileWatcher.Stop();
+            _fileWatcher = new FileWatcherEx.FileWatcherEx() {
+                FolderPath = pathToWatch,
+                IncludeSubdirectories = Configs.IsRecursiveLoading,
 
                 // auto Invoke the form if required, no need to invidiually invoke in each event
                 SynchronizingObject = this
             };
 
-            this._fileWatcher.OnCreated += FileWatcher_OnCreated;
-            this._fileWatcher.OnDeleted += FileWatcher_OnDeleted;
-            this._fileWatcher.OnChanged += FileWatcher_OnChanged;
-            this._fileWatcher.OnRenamed += FileWatcher_OnRenamed;
+            _fileWatcher.OnCreated += FileWatcher_OnCreated;
+            _fileWatcher.OnDeleted += FileWatcher_OnDeleted;
+            _fileWatcher.OnChanged += FileWatcher_OnChanged;
+            _fileWatcher.OnRenamed += FileWatcher_OnRenamed;
 
-            this._fileWatcher.Start();
+            _fileWatcher.Start();
         }
 
-
-        /// <summary>
-        /// Prepare to load images. User has dragged multiple files / paths onto IG.
-        /// </summary>
-        /// <param name="paths"></param>
-        private void PrepareMulti(string[] paths)
-        {
-            // TODO re-loading of the image list/folder currently does NOT invoke this code!
-            // TODO don't have any 'memory' of initial paths; re-load of image list/folder will be confused
-
-            HashSet<string> pathsLoaded = new HashSet<string>(); // track paths loaded to prevent duplicates
-            List<string> allFilesToLoad = new List<string>();
-            bool firstPath = true;
-            foreach (var apath in paths)
-            {
-                string dirPath = "";
-                if (File.Exists(apath))
-                {
-                    if (Path.GetExtension(apath).ToLower() == ".lnk")
-                        dirPath = Shortcuts.FolderFromShortcut(apath);
-                    else
-                        dirPath = Path.GetDirectoryName(apath);
-                }
-                else if (Directory.Exists(apath))
-                {
-                    dirPath = apath;
-                }
-                else
-                {
-                    continue; 
-                }
-
-                // TODO Currently only have the ability to watch a single path for changes!
-                if (firstPath)
-                {
-                    firstPath = false;
-                    WatchPath(dirPath);
-                }
-
-                // KBR 20181004 Fix observed bug: dropping multiple files from the same path
-                // would load ALL files in said path multiple times! Prevent loading the same
-                // path more than once.
-                if (pathsLoaded.Contains(dirPath))
-                    continue;
-                pathsLoaded.Add(dirPath);
-
-                var imageFilenameList = LoadImageFilesFromDirectory(dirPath);
-                allFilesToLoad.AddRange(imageFilenameList);
-            }
-
-            LoadImages(allFilesToLoad, "");
-        }
-
-
-        private void ImageList_OnFinishLoadingImage(object sender, EventArgs e)
-        {
-            //clear text when finishing
-            DisplayTextMessage("", 0);
+        private void ImageList_OnFinishLoadingImage(object sender, EventArgs e) {
+            // clear text when finishing
+            ShowToastMsg("", 0);
         }
 
         /// <summary>
         /// Select current thumbnail
         /// </summary>
-        private void SelectCurrentThumbnail()
-        {
-            if (thumbnailBar.Items.Count > 0)
-            {
+        private void SelectCurrentThumbnail() {
+            if (thumbnailBar.Items.Count > 0) {
                 thumbnailBar.ClearSelection();
 
-                try
-                {
-                    thumbnailBar.Items[GlobalSetting.CurrentIndex].Selected = true;
-                    thumbnailBar.Items[GlobalSetting.CurrentIndex].Focused = true;
-                    thumbnailBar.EnsureVisible(GlobalSetting.CurrentIndex);
+                try {
+                    thumbnailBar.Items[Local.CurrentIndex].Selected = true;
+                    thumbnailBar.Items[Local.CurrentIndex].Focused = true;
+                    thumbnailBar.ScrollToIndex(Local.CurrentIndex);
                 }
-                catch (Exception) { }
+                catch { }
             }
         }
-
 
         /// <summary>
         /// Sort and find all supported image from directory
         /// </summary>
         /// <param name="path">Image folder path</param>
-        private List<string> LoadImageFilesFromDirectory(string path)
-        {
-            //Load image order from config
-            GlobalSetting.LoadImageOrderConfig();
-
-            //Get files from dir
-            var fileList = DirectoryFinder.FindFiles(path,
-                GlobalSetting.IsRecursiveLoading,
-                new Predicate<FileInfo>(delegate (FileInfo fi)
-                {
+        private static IEnumerable<string> LoadImageFilesFromDirectory(string path) {
+            // Get files from dir
+            return DirectoryFinder.FindFiles(path,
+                Configs.IsRecursiveLoading,
+                new Predicate<FileInfo>((FileInfo fi) => {
                     // KBR 20180607 Rework predicate to use a FileInfo instead of the filename.
                     // By doing so, can use the attribute data already loaded into memory, 
                     // instead of fetching it again (via File.GetAttributes). A re-fetch is
@@ -455,129 +439,168 @@ namespace ImageGlass
                     if (fi.FullName == null) // KBR not sure why but occasionally getting null filename
                         return false;
 
-                    string extension = fi.Extension ?? "";
+                    var extension = fi.Extension ?? "";
                     extension = extension.ToLower(); // Path.GetExtension(f).ToLower() ?? ""; //remove blank extension
 
                     // checks if image is hidden and ignores it if so
-                    if (GlobalSetting.IsShowingHiddenImages == false)
-                    {
+                    if (!Configs.IsShowingHiddenImages) {
                         var attributes = fi.Attributes; // File.GetAttributes(f);
-                        var isHidden = attributes.HasFlag(FileAttributes.Hidden);
-                        if (isHidden)
-                        {
+                        var isHidden = (attributes & FileAttributes.Hidden) != 0;
+                        if (isHidden) {
                             return false;
                         }
                     }
-                    if (extension.Length > 0 && GlobalSetting.ImageFormatHashSet.Contains(extension))
-                    {
-                        return true;
-                    }
 
-                    return false;
+                    return extension.Length > 0 && Configs.AllFormats.Contains(extension);
                 }));
-            
-
-            var list = SortImageList(fileList);
-
-            return list;
         }
 
+        /// <summary>
+        /// Sort image list
+        /// </summary>
+        /// <param name="fileList"></param>
+        /// <returns></returns>
+        private static List<string> SortImageList(IEnumerable<string> fileList) {
+            // NOTE: relies on LocalSetting.ActiveImageLoadingOrder been updated first!
 
-        private List<string> SortImageList(ConcurrentBag<string> fileList)
-        {
             var list = new List<string>();
 
-            //Sort image file
-            if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.Name)
-            {
-                var arr = fileList.ToArray();
-                Array.Sort(arr, new WindowsNaturalSort());
-                list.AddRange(arr);
+            // KBR 20190605 Fix observed limitation: to more closely match the Windows Explorer's sort
+            // order, we must sort by the target column, then by name.
+            var naturalSortComparer = Local.ActiveImageLoadingOrderType == ImageOrderType.Desc
+                                        ? (IComparer<string>)new ReverseWindowsNaturalSort()
+                                        : new WindowsNaturalSort();
 
-                //list.AddRange(FileLogicalComparer.Sort(dsFile.ToArray()));
+            // initiate directory sorter to a comparer that does nothing
+            // if user wants to group by directory, we initiate the real comparer
+            var directorySortComparer = (IComparer<string>)new IdentityComparer();
+            if (Configs.IsGroupImagesByDirectory) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    directorySortComparer = new ReverseWindowsDirectoryNaturalSort();
+                }
+                else {
+                    directorySortComparer = new WindowsDirectoryNaturalSort();
+                }
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.Length)
-            {
+
+            // KBR 20190605 Fix observed discrepancy: using UTC for create, but not for write/access times
+
+            // Sort image file
+            if (Local.ActiveImageLoadingOrder == ImageOrderBy.Name) {
                 list.AddRange(fileList
-                    .OrderBy(f => new FileInfo(f).Length));
+                    .OrderBy(f => f, directorySortComparer)
+                    .ThenBy(f => f, naturalSortComparer));
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.CreationTime)
-            {
-                list.AddRange(fileList
-                    .OrderBy(f => new FileInfo(f).CreationTimeUtc));
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.Length) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenByDescending(f => new FileInfo(f).Length)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+                else {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenBy(f => new FileInfo(f).Length)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.Extension)
-            {
-                list.AddRange(fileList
-                    .OrderBy(f => new FileInfo(f).Extension));
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.CreationTime) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenByDescending(f => new FileInfo(f).CreationTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+                else {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenBy(f => new FileInfo(f).CreationTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.LastAccessTime)
-            {
-                list.AddRange(fileList
-                    .OrderBy(f => new FileInfo(f).LastAccessTime));
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.Extension) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenByDescending(f => new FileInfo(f).Extension)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+                else {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenBy(f => new FileInfo(f).Extension)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.LastWriteTime)
-            {
-                list.AddRange(fileList
-                    .OrderBy(f => new FileInfo(f).LastWriteTime));
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.LastAccessTime) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenByDescending(f => new FileInfo(f).LastAccessTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+                else {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenBy(f => new FileInfo(f).LastAccessTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
             }
-            else if (GlobalSetting.ImageLoadingOrder == ImageOrderBy.Random)
-            {
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.LastWriteTime) {
+                if (Local.ActiveImageLoadingOrderType == ImageOrderType.Desc) {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenByDescending(f => new FileInfo(f).LastWriteTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+                else {
+                    list.AddRange(fileList
+                        .OrderBy(f => f, directorySortComparer)
+                        .ThenBy(f => new FileInfo(f).LastWriteTimeUtc)
+                        .ThenBy(f => f, naturalSortComparer));
+                }
+            }
+            else if (Local.ActiveImageLoadingOrder == ImageOrderBy.Random) {
+                // NOTE: ignoring the 'descending order' setting
                 list.AddRange(fileList
-                    .OrderBy(f => Guid.NewGuid()));
+                    .OrderBy(f => f, directorySortComparer)
+                    .ThenBy(_ => Guid.NewGuid()));
             }
 
             return list;
         }
-
 
         /// <summary>
         /// Clear and reload all thumbnail image
         /// </summary>
-        private void LoadThumbnails()
-        {
+        private void LoadThumbnails() {
             thumbnailBar.SuspendLayout();
             thumbnailBar.Items.Clear();
-            thumbnailBar.ThumbnailSize = new Size(GlobalSetting.ThumbnailDimension, GlobalSetting.ThumbnailDimension);
+            thumbnailBar.ThumbnailSize = new Size((int)Configs.ThumbnailDimension, (int)Configs.ThumbnailDimension);
 
-            for (int i = 0; i < GlobalSetting.ImageList.Length; i++)
-            {
-                ImageListView.ImageListViewItem lvi = new ImageListView.ImageListViewItem(GlobalSetting.ImageList.GetFileName(i));
-                lvi.Tag = GlobalSetting.ImageList.GetFileName(i);
+            for (var i = 0; i < Local.ImageList.Length; i++) {
+                var lvi = new ImageListView.ImageListViewItem(Local.ImageList.GetFileName(i)) {
+                    Tag = Local.ImageList.GetFileName(i)
+                };
 
                 thumbnailBar.Items.Add(lvi);
             }
             thumbnailBar.ResumeLayout();
-        }
 
-
-        /// <summary>
-        /// Change image
-        /// </summary>
-        /// <param name="step">Image step to change. Zero is reload the current image.</param>
-        private void NextPic(int step)
-        {
-            // KBR 20190302 Something which has bugged me for a long time: if I'm viewing a slideshow and
-            // force a 'next image', the new image is NOT shown for the length of the slideshow timer.
-            // This below fixes that.
-            if (GlobalSetting.IsPlaySlideShow)
-            {
-                timSlideShow.Enabled = false;
-                timSlideShow.Enabled = true;
-            }
-            NextPic(step, false);
+            SelectCurrentThumbnail();
         }
 
         /// <summary>
         /// Change image
         /// </summary>
         /// <param name="step">Image step to change. Zero is reload the current image.</param>
-        /// <param name="configs">Configuration for the next load</param>
+        /// <param name="isKeepZoomRatio"></param>
         /// <param name="isSkipCache"></param>
-        private async void NextPic(int step, bool isKeepZoomRatio, bool isSkipCache = false)
-        {
-            System.Threading.SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+        /// <param name="pageIndex"></param>
+        public async Task NextPicAsync(int step, bool isKeepZoomRatio = false, bool isSkipCache = false, int pageIndex = 0, string filename = "") {
 
+            System.Threading.SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
             // cancel the previous loading task
             _cancelToken.Cancel();
@@ -585,300 +608,404 @@ namespace ImageGlass
             _cancelToken = token;
 
             // stop the animation
-            if (picMain.IsAnimating)
-            {
+            if (picMain.IsAnimating) {
                 picMain.StopAnimating();
             }
 
-            //Save previous image if it was modified
-            if (File.Exists(LocalSetting.ImageModifiedPath) && GlobalSetting.IsSaveAfterRotating)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._SaveChanges"], 2000);
+            // Save previous image if it was modified
+            if (File.Exists(Local.ImageModifiedPath) && Configs.IsSaveAfterRotating) {
+                ShowToastMsg(Configs.Language.Items[$"{Name}._SaveChanges"], 2000);
 
                 Application.DoEvents();
-                ImageSaveChange();
+                _ = SaveImageChangeAsync();
 
-                //remove the old image data from cache
-                GlobalSetting.ImageList.Unload(GlobalSetting.CurrentIndex);
+                // remove the old image data from cache
+                Local.ImageList.Unload(Local.CurrentIndex);
 
-                //update thumbnail
-                thumbnailBar.Items[GlobalSetting.CurrentIndex].Update();
+                // update thumbnail
+                thumbnailBar.Items[Local.CurrentIndex].Update();
+            }
+            else {
+                // KBR 20190804 Fix obscure issue: 
+                // 1. Rotate/flip image with "IsSaveAfterRotating" is OFF
+                // 2. Move through images
+                // 3. Turn "IsSaveAfterRotating" ON
+                // 4. On navigate to another image, the change made at step 1 will be saved.
+                Local.ImageModifiedPath = "";
             }
 
+            SetStatusBar();
             picMain.Text = "";
-            LocalSetting.IsTempMemoryData = false;
+            Local.IsTempMemoryData = false;
 
-            if (GlobalSetting.ImageList.Length < 1)
-            {
-                Text = Application.ProductName;
-
-                GlobalSetting.IsImageError = true;
+            if (filename.Length == 0 && Local.ImageList.Length == 0) {
+                Local.ImageError = new Exception("File not found.");
                 picMain.Image = null;
-                LocalSetting.ImageModifiedPath = "";
+                Local.ImageModifiedPath = "";
 
                 return;
             }
 
-            //temp index
-            int tempIndex = GlobalSetting.CurrentIndex + step;
 
-            if (!GlobalSetting.IsPlaySlideShow && !GlobalSetting.IsLoopBackViewer)
-            {
+            #region Validate image index
+
+            // temp index
+            var tempIndex = Local.CurrentIndex + step;
+
+            // Issue #609: do not auto-reactivate slideshow if disabled
+            if (Configs.IsSlideshow && timSlideShow.Enabled) {
+                timSlideShow.Enabled = false;
+                timSlideShow.Enabled = true;
+            }
+
+            if (!Configs.IsSlideshow && !Configs.IsLoopBackViewer) {
                 //Reach end of list
-                if (tempIndex >= GlobalSetting.ImageList.Length)
-                {
-                    DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._LastItemOfList"], 1000);
+                if (tempIndex >= Local.ImageList.Length) {
+                    ShowToastMsg(Configs.Language.Items[$"{Name}._LastItemOfList"], 1000);
                     return;
                 }
 
                 //Reach the first item of list
-                if (tempIndex < 0)
-                {
-                    DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._FirstItemOfList"], 1000);
+                if (tempIndex < 0) {
+                    ShowToastMsg(Configs.Language.Items[$"{Name}._FirstItemOfList"], 1000);
                     return;
                 }
             }
 
-            //Check if current index is greater than upper limit
-            if (tempIndex >= GlobalSetting.ImageList.Length)
+            // Check if current index is greater than upper limit
+            if (tempIndex >= Local.ImageList.Length)
                 tempIndex = 0;
 
-            //Check if current index is less than lower limit
+            // Check if current index is less than lower limit
             if (tempIndex < 0)
-                tempIndex = GlobalSetting.ImageList.Length - 1;
+                tempIndex = Local.ImageList.Length - 1;
 
-            //Update current index
-            GlobalSetting.CurrentIndex = tempIndex;
+            // Update current index
+            Local.CurrentIndex = tempIndex;
 
-            //Select thumbnail item
+            #endregion
+
+
+            // Select thumbnail item
             SelectCurrentThumbnail();
-            
 
-            // Update the basic info
-            UpdateStatusBar();
-            
+            // Raise image changed event
+            Local.RaiseImageChangedEvent();
 
-            //The image data will load
+            // The image data will load
             Bitmap im = null;
 
-            try
-            {
+            try {
                 // apply Color Management settings
-                GlobalSetting.ImageList.IsApplyColorProfileForAll = GlobalSetting.IsApplyColorProfileForAll;
-                GlobalSetting.ImageList.ColorProfileName = GlobalSetting.ColorProfile;
+                Local.ImageList.IsApplyColorProfileForAll = Configs.IsApplyColorProfileForAll;
+                Local.ImageList.ColorProfileName = Configs.ColorProfile;
 
-                _isAppBusy = true;
-                var loadingTimer = new Timer()
-                {
-                    Interval = 2000
-                };
-                loadingTimer.Tick += LoadingMessageTimer_Tick;
-                loadingTimer.Enabled = true;
-                loadingTimer.Start();
-
-                //Read image data
-                im = await Task.Run(() =>
-                {
-                    return GlobalSetting.ImageList.GetImage(GlobalSetting.CurrentIndex, isSkipCache: isSkipCache);
-                });
-                GlobalSetting.IsImageError = GlobalSetting.ImageList.IsErrorImage;
+                // put app in a 'busy' state around image load: allows us to prevent the user
+                // from skipping past a slow-to-load image by processing too many arrow clicks
+                SetAppBusy(true);
 
 
-                if (!token.Token.IsCancellationRequested)
-                {
-                    //Show image
+                Heart.Img bmpImg;
+
+                // directly load the image file, skip image list
+                if (filename.Length > 0) {
+                    bmpImg = new Heart.Img(filename);
+                    await bmpImg.LoadAsync(
+                        colorProfileName: Configs.ColorProfile,
+                        isApplyColorProfileForAll: Configs.IsApplyColorProfileForAll,
+                        channel: (int)Local.Channels);
+                }
+                else {
+                    bmpImg = await Local.ImageList.GetImgAsync(
+                        Local.CurrentIndex,
+                        isSkipCache: isSkipCache,
+                        pageIndex: pageIndex
+                       ).ConfigureAwait(true);
+                }
+
+                im = bmpImg.Image;
+
+                // Update current frame index
+                Local.CurrentPageIndex = bmpImg.ActivePageIndex;
+                Local.CurrentPageCount = bmpImg.PageCount;
+
+                Local.CurrentExif = bmpImg.Exif;
+                Local.CurrentColor = bmpImg.ColorProfile;
+
+                // clear busy state
+                SetAppBusy(false);
+
+                Local.ImageError = bmpImg.Error;
+
+                if (im != null && !token.Token.IsCancellationRequested) {
+                    // Refresh picMain to update the active page
+                    picMain.Refresh();
                     picMain.Image = im;
+
                     im = null;
 
-
-                    //Reset the zoom mode if isKeepZoomRatio = FALSE
-                    if (!isKeepZoomRatio)
-                    {
-                        //reset zoom mode
-                        ApplyZoomMode(GlobalSetting.ZoomMode);
+                    // Reset the zoom mode if isKeepZoomRatio = FALSE
+                    if (!isKeepZoomRatio) {
+                        if (Configs.IsWindowFit) {
+                            WindowFitMode();
+                        }
+                        else {
+                            // reset zoom mode
+                            ApplyZoomMode(Configs.ZoomMode);
+                        }
                     }
-
-
-                    //Run in another thread
-                    Parallel.Invoke(() =>
-                    {
-                        //Release unused images
-                        if (GlobalSetting.CurrentIndex - 2 >= 0)
-                        {
-                            GlobalSetting.ImageList.Unload(GlobalSetting.CurrentIndex - 2);
-                        }
-                        if (!GlobalSetting.IsImageBoosterBack && GlobalSetting.CurrentIndex - 1 >= 0)
-                        {
-                            GlobalSetting.ImageList.Unload(GlobalSetting.CurrentIndex - 1);
-                        }
-                    });
-                }
-
-                _isAppBusy = false;
-
-            }
-            catch (Exception)
-            {
-                picMain.Image = null;
-                LocalSetting.ImageModifiedPath = "";
-
-                if (!File.Exists(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)))
-                {
-                    GlobalSetting.ImageList.Unload(GlobalSetting.CurrentIndex);
                 }
             }
+            catch (Exception ex) {
+                Local.ImageError = ex;
+            }
 
+            // image error
+            if (Local.ImageError != null) {
+                SetAppBusy(false); // make sure busy state is off if exception during image load
 
-            if (GlobalSetting.IsImageError)
-            {
-                picMain.Text = GlobalSetting.LangPack.Items["frmMain.picMain._ErrorText"];
                 picMain.Image = null;
-                LocalSetting.ImageModifiedPath = "";
+                Local.ImageModifiedPath = "";
+                Local.CurrentPageIndex = 0;
+                Local.CurrentPageCount = 0;
+                Local.CurrentExif = null;
+                Local.CurrentColor = null;
+
+                if (!File.Exists(Local.ImageList.GetFileName(Local.CurrentIndex))) {
+                    Local.ImageList.Unload(Local.CurrentIndex);
+                }
+
+                picMain.Text = Configs.Language.Items[$"{Name}.picMain._ErrorText"] + "\r\n" + Local.ImageError.Source + ": " + Local.ImageError.Message;
+                SetStatusBar();
             }
 
             _isDraggingImage = false;
 
-            //Collect system garbage
+            // reset countdown timer value
+            _slideshowCountdown = Configs.RandomizeSlideshowInterval();
+
+            // reset Cropping region
+            ShowCropTool(mnuMainCrop.Checked);
+
+            // auto-show Page Nav tool
+            if (Local.CurrentPageCount > 1 && Configs.IsShowPageNavAuto) {
+                ShowPageNavTool(true);
+            }
+            // hide the Page Nav tool
+            else if (!Configs.IsShowPageNavOnStartup) {
+                ShowPageNavTool(false);
+            }
+
+            // Collect system garbage
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
+
+
+            void SetAppBusy(bool isbusy) {
+                Timer _loadingTimer = null;
+
+                _isAppBusy = isbusy;
+                // fire-eggs 20190902 fix observed issue: cursor switched to
+                // arrow when it maybe should be cross or nav-arrow
+                if (isbusy)
+                    picMain.Cursor = Cursors.WaitCursor;
+                else
+                    picMain.Cursor = Cursors.Default;
+
+                // Part of Issue #485 fix: failure to disable timer after image load meant message 
+                // could appear after image already loaded
+                if (!isbusy && _loadingTimer != null) {
+                    _loadingTimer.Enabled = false;
+                    _loadingTimer.Dispose();
+                    _loadingTimer = null;
+                }
+                if (isbusy) {
+                    _loadingTimer = new Timer() // can't re-use timer, re-create each time
+                    {
+                        Interval = 2000
+                    };
+                    _loadingTimer.Tick += LoadingMessageTimer_Tick;
+                    _loadingTimer.Enabled = true;
+                }
+            }
         }
 
 
         /// <summary>
         /// Update image information on status bar
         /// </summary>
-        private void UpdateStatusBar()
-        {
-            string appName = Application.ProductName;
-            string indexTotal = string.Empty;
-            string filename = string.Empty;
-            string zoom = string.Empty;
-            string imgSize = string.Empty;
-            string fileSize = string.Empty;
-            string fileDate = string.Empty;
+        private void SetStatusBar(string text = "") {
+            if (Configs.IsUseEmptyTitleBar) {
+                this.Text = "";
+                return;
+            }
+            else if (!string.IsNullOrWhiteSpace(text)) {
+                this.Text = text;
+                return;
+            }
 
+            var appName = Application.ProductName;
+            const string SEP = "  |  ";
+            var imgSize = string.Empty;
+            var fileSize = string.Empty;
+            var exifInfo = string.Empty;
 
-            if (LocalSetting.IsTempMemoryData)
-            {
-                var imgData = GlobalSetting.LangPack.Items["frmMain._ImageData"];
-                zoom = $"{picMain.Zoom.ToString()}%";
+            string zoom;
+            if (Local.IsTempMemoryData) {
+                var imgData = Configs.Language.Items[$"{Name}._ImageData"];
+                zoom = $"{picMain.Zoom}%";
 
-                if (picMain.Image != null)
-                {
-                    try
-                    {
+                if (picMain.Image != null) {
+                    try {
                         imgSize = $"{picMain.Image.Width} x {picMain.Image.Height} px";
                     }
                     catch { }
 
-                    //(Image data)  |  {zoom}  |  {image size} - ImageGlass
+                    // (Image data)  |  {zoom}  |  {image size} - ImageGlass
                     this.Text = $"{imgData}  |  {zoom}  |  {imgSize}  - {appName}";
                 }
-                else
-                {
+                else {
                     this.Text = $"{imgData}  |  {zoom}  - {appName}";
                 }
             }
-            else
-            {
-                if (GlobalSetting.ImageList.Length < 1)
-                {
+            else {
+                if (Local.ImageList.Length < 1) {
                     this.Text = appName;
                     return;
                 }
 
-                string currentFilePath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+                var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
 
-                // when there is a problem with a file, don't try to show some info
-                bool isShowMoreData = File.Exists(currentFilePath);
+                // when there is a problem with a file, don't try to show more info
+                var isShowMoreData = File.Exists(filename);
 
-                indexTotal = $"{(GlobalSetting.CurrentIndex + 1)}/{GlobalSetting.ImageList.Length} {GlobalSetting.LangPack.Items["frmMain._Text"]}";
+                var indexTotal = $"{Local.CurrentIndex + 1}/{Local.ImageList.Length} {Configs.Language.Items[$"{Name}._Files"]}";
 
-                if (isShowMoreData)
-                {
-                    fileSize = ImageInfo.GetFileSize(currentFilePath);
-                    fileDate = File.GetCreationTime(currentFilePath).ToString("yyyy/MM/dd HH:mm:ss");
+                if (isShowMoreData) {
+                    fileSize = ImageInfo.GetFileSize(filename);
+
+                    // get color profile
+                    var colorProfile = Local.CurrentColor?.ColorSpace.ToString();
+                    exifInfo += colorProfile?.Length > 0 ? $"{SEP}{colorProfile}" : "";
+
+                    // get date info
+                    exifInfo += $"{SEP}{GetImageDateInfo(filename)}";
                 }
 
-
-                if (GlobalSetting.IsDisplayBasenameOfImage)
-                {
-                    filename = Path.GetFileName(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex));
+                if (Configs.IsDisplayBasenameOfImage) {
+                    filename = Path.GetFileName(filename);
                 }
-                else
-                {
-                    //auto ellipsis the filename
-                    //the minimum text to show is Drive letter + basename.
-                    //ex: C:\...\example.jpg
-                    filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+                else {
+                    // auto ellipsis the filename
+                    // the minimum text to show is Drive letter + basename.
+                    // ex: C:\...\example.jpg
                     var basename = Path.GetFileName(filename);
 
                     var charWidth = this.CreateGraphics().MeasureString("A", this.Font).Width;
-                    var textMaxLength = (this.Width - DPIScaling.TransformNumber(400)) / charWidth;
-
+                    var textMaxLength = (this.Width - DPIScaling.Transform(400)) / charWidth;
                     var maxLength = (int)Math.Max(basename.Length + 8, textMaxLength);
 
                     filename = Helper.ShortenPath(filename, maxLength);
                 }
 
+                // image error
+                if (Local.ImageError != null) {
+                    Local.FPageNav.lblPageInfo.Text = "";
 
-                if (GlobalSetting.IsImageError)
-                {
                     if (!isShowMoreData) // size and date not available
-                        this.Text = $"{filename}  |  {indexTotal}  - {appName}";
+                        this.Text = $"{filename}{SEP}{indexTotal}  - {appName}";
                     else
-                        this.Text = $"{filename}  |  {indexTotal}  |  {fileSize}  |  {fileDate}  - {appName}";
+                        this.Text = $"{filename}{SEP}{indexTotal}{SEP}{fileSize}  - {appName}";
                 }
-                else
-                {
-                    zoom = $"{picMain.Zoom.ToString("F2")}%";
+                else {
+                    zoom = $"{picMain.Zoom:F2}%";
 
-                    if (picMain.Image != null)
-                    {
-                        try
-                        {
+                    // pages information
+                    var pageInfo = $"{Local.CurrentPageIndex + 1}/{Local.CurrentPageCount}";
+                    Local.FPageNav.lblPageInfo.Text = pageInfo;
+
+                    if (Local.CurrentPageCount > 1) {
+                        pageInfo = $"{pageInfo} {Configs.Language.Items[$"{Name}._Pages"]}{SEP}";
+                    }
+                    else {
+                        pageInfo = "";
+                    }
+
+                    // image info
+                    if (picMain.Image != null) {
+                        try {
                             imgSize = $"{picMain.Image.Width} x {picMain.Image.Height} px";
                         }
                         catch { }
 
-
-                        this.Text = $"{filename}  |  {indexTotal}  |  {zoom}  |  {imgSize}  |  {fileSize}  |  {fileDate}  - {appName}";
+                        this.Text = $"{filename}{SEP}{indexTotal}{SEP}{pageInfo}{zoom}{SEP}{imgSize}{SEP}{fileSize}{exifInfo}  - {appName}";
                     }
-                    else
-                    {
-                        this.Text = $"{filename}  |  {indexTotal}  |  {zoom}  |  {fileSize}  |  {fileDate}  - {appName}";
+                    else {
+                        this.Text = $"{filename}{SEP}{indexTotal}{SEP}{pageInfo}{zoom}{SEP}{fileSize}{exifInfo}  - {appName}";
                     }
                 }
             }
-
         }
-        
+
+        /// <summary>
+        /// Get image datetime info, returns either Exif.DateTimeOriginal (o), Exif.DateTime, or File.LastWriteTime (m)
+        /// </summary>
+        /// <param name="filename">The full file path</param>
+        /// <returns></returns>
+        private static string GetImageDateInfo(string filename) {
+            static string GetExifDateInfo(ExifTag<string> tag) {
+                // get date
+                var dateExif = Local.CurrentExif?.GetValue(tag)?.Value;
+
+                if (DateTime.TryParseExact(dateExif,
+                    "yyyy:MM:dd HH:mm:ss",
+                    CultureInfo.CurrentCulture,
+                    DateTimeStyles.None,
+                    out var dateTaken)) {
+                    return $"{dateTaken:yyyy/MM/dd HH:mm:ss}";
+                }
+
+                return string.Empty;
+            }
+
+            var exifDateOriginal = GetExifDateInfo(ExifTag.DateTimeOriginal);
+            if (exifDateOriginal.Length == 0) {
+                var exifDate = GetExifDateInfo(ExifTag.DateTime);
+                if (exifDate.Length == 0) {
+                    var fileDateModified = File.GetLastWriteTime(filename).ToString("yyyy/MM/dd HH:mm:ss");
+
+                    // return LastWriteTime
+                    return fileDateModified + " (m)";
+                }
+
+                // return DateTime
+                return exifDate;
+            }
+
+            // return DateTimeOriginal
+            return exifDateOriginal + " (o)";
+        }
+
         #endregion
-
-
 
         #region Key event
 
-        private void frmMain_KeyDown(object sender, KeyEventArgs e)
-        {
+        private void frmMain_KeyDown(object sender, KeyEventArgs e) {
             //this.Text = e.KeyValue.ToString();
 
             #region Register MAIN MENU shortcuts
-            bool checkMenuShortcut(ToolStripMenuItem mnu)
-            {
-                Keys pressed = e.KeyCode;
-                if (e.Control) pressed = pressed | Keys.Control;
-                if (e.Shift) pressed = pressed | Keys.Shift;
-                if (e.Alt) pressed = pressed | Keys.Alt;
+            bool checkMenuShortcut(ToolStripMenuItem mnu) {
+                var pressed = e.KeyCode;
+                if (e.Control) pressed |= Keys.Control;
+                if (e.Shift) pressed |= Keys.Shift;
+                if (e.Alt) pressed |= Keys.Alt;
 
-                if (mnu.ShortcutKeys == pressed)
-                {
+                if (mnu.ShortcutKeys == pressed) {
                     mnu.PerformClick();
                     return true;
                 }
-                foreach (ToolStripMenuItem child in mnu.DropDownItems.OfType<ToolStripMenuItem>())
-                {
+                foreach (var child in mnu.DropDownItems.OfType<ToolStripMenuItem>()) {
                     checkMenuShortcut(child);
                 }
 
@@ -886,10 +1013,8 @@ namespace ImageGlass
             }
 
             //register context menu shortcuts
-            foreach (ToolStripMenuItem item in mnuMain.Items.OfType<ToolStripMenuItem>())
-            {
-                if (checkMenuShortcut(item))
-                {
+            foreach (var item in mnuMain.Items.OfType<ToolStripMenuItem>()) {
+                if (checkMenuShortcut(item)) {
                     return;
                 }
             }
@@ -898,23 +1023,20 @@ namespace ImageGlass
 
             #region Detect WIN logo key
             _isWindowsKeyPressed = false;
-            if (e.KeyData == Keys.LWin || e.KeyData == Keys.RWin)
-            {
+            if (e.KeyData == Keys.LWin || e.KeyData == Keys.RWin) {
                 _isWindowsKeyPressed = true;
             }
             #endregion
 
-            
-            //Show main menu
-            #region Ctrl + `
-            if (e.KeyValue == 192 && !e.Control && !e.Shift && !e.Alt) // `
-            {
-                mnuMain.Show(toolMain, toolMain.Width - mnuMain.Width, toolMain.Height);
-            }
-            #endregion
 
+            // KBR 20191210 Fix observed issue: when using WIN+down-arrow to minimize in
+            // frameless mode, the first key code after restore would be ignored. Moved
+            // these lines to _after_ WIN logo key check is complete.
+            var hasNoMods = !e.Control && !e.Shift && !e.Alt;
+            var ignore = _isAppBusy || _isWindowsKeyPressed;
+            _isDraggingImage = false;
 
-            // Rotation Counterclockwise----------------------------------------------------
+            // Rotation Counterclockwise
             #region Ctrl + ,
             if (e.KeyValue == 188 && e.Control && !e.Shift && !e.Alt)//Ctrl + ,
             {
@@ -924,7 +1046,7 @@ namespace ImageGlass
             #endregion
 
 
-            //Rotate Clockwise--------------------------------------------------------------
+            // Rotate Clockwise
             #region Ctrl + .
             if (e.KeyValue == 190 && e.Control && !e.Shift && !e.Alt)//Ctrl + .
             {
@@ -934,7 +1056,7 @@ namespace ImageGlass
             #endregion
 
 
-            //Flip Horizontally-----------------------------------------------------------
+            // Flip Horizontally
             #region Ctrl + ;
             if (e.KeyValue == 186 && e.Control && !e.Shift && !e.Alt)//Ctrl + ;
             {
@@ -944,7 +1066,7 @@ namespace ImageGlass
             #endregion
 
 
-            //Flip Vertically-----------------------------------------------------------
+            // Flip Vertically
             #region Ctrl + '
             if (e.KeyValue == 222 && e.Control && !e.Shift && !e.Alt)//Ctrl + '
             {
@@ -954,7 +1076,7 @@ namespace ImageGlass
             #endregion
 
 
-            //Clear clipboard----------------------------------------------------------------
+            // Clear clipboard
             #region CTRL + `
             if (e.KeyValue == 192 && e.Control && !e.Shift && !e.Alt)//CTRL + `
             {
@@ -964,8 +1086,8 @@ namespace ImageGlass
             #endregion
 
 
-            //Zoom + ------------------------------------------------------------------------
-            #region Ctrl + = or = or + (numPad)
+            // Zoom in
+            #region Ctrl + = / = / + (numPad)
             if ((e.KeyValue == 187 || (e.KeyValue == 107 && !e.Control)) && !e.Shift && !e.Alt)// Ctrl + =
             {
                 btnZoomIn_Click(null, null);
@@ -974,8 +1096,8 @@ namespace ImageGlass
             #endregion
 
 
-            //Zoom - ------------------------------------------------------------------------
-            #region Ctrl + - or - or - (numPad)
+            // Zoom out
+            #region Ctrl + - / - / - (numPad)
             if ((e.KeyValue == 189 || (e.KeyValue == 109 && !e.Control)) && !e.Shift && !e.Alt)// Ctrl + -
             {
                 btnZoomOut_Click(null, null);
@@ -984,17 +1106,7 @@ namespace ImageGlass
             #endregion
 
 
-            //Zoom to fit--------------------------------------------------------------------
-            #region CTRL + /
-            if (e.KeyValue == 191 && e.Control && !e.Shift && !e.Alt)//CTRL + /
-            {
-                mnuMainScaleToFit_Click(null, null);
-                return;
-            }
-            #endregion
-
-
-            //Actual size image -------------------------------------------------------------
+            // Actual size image
             #region Ctrl + 0 / Ctrl + Num0 / 0 / Num0
             if (!e.Shift && !e.Alt && (e.KeyValue == 48 || e.KeyValue == 96)) // 0 || Num0 || Ctrl + 0 || Ctrl + Num0
             {
@@ -1002,30 +1114,18 @@ namespace ImageGlass
                 return;
             }
             #endregion
-            
-
-            //Full screen--------------------------------------------------------------------
-            #region ALT + ENTER
-            if (e.Alt && e.KeyCode == Keys.Enter && !e.Control && !e.Shift)//Alt + Enter
-            {
-                mnuMainFullScreen.PerformClick();
-                return;
-            }
-            #endregion
 
 
-            //ESC ultility------------------------------------------------------------------
+            // ESC ultility
             #region ESC
             if (e.KeyCode == Keys.Escape && !e.Control && !e.Shift && !e.Alt)//ESC
             {
                 //exit slideshow
-                if (GlobalSetting.IsPlaySlideShow)
-                {
+                if (Configs.IsSlideshow) {
                     mnuMainSlideShowExit_Click(null, null);
                 }
                 //Quit ImageGlass
-                else if (GlobalSetting.IsPressESCToQuit)
-                {
+                else if (Configs.IsPressESCToQuit) {
                     Application.Exit();
                 }
                 return;
@@ -1033,65 +1133,291 @@ namespace ImageGlass
             #endregion
 
 
-            //Ctrl---------------------------------------------------------------------------
-            #region CTRL (for Zooming)
-            if (e.Control && !e.Alt && !e.Shift)//Ctrl
-            {
-                //Enable dragging viewing image to desktop feature---------------------------
-                _isDraggingImage = true;
-                
-                return;
-            }
-            #endregion
-
-
-            //Previous Image----------------------------------------------------------------
+            // Previous Image
             #region LEFT ARROW / PAGE UP
-            if (!_isWindowsKeyPressed && !_isAppBusy && (e.KeyValue == 33 || e.KeyValue == 37) &&
-                !e.Control && !e.Shift && !e.Alt)//Left arrow / PageUp
-            {
-                NextPic(-1);
+            if (e.KeyValue == (int)Keys.Left && hasNoMods) {
+                if (ignore) {
+                    e.Handled = true; // Issue #963: leaning on the key will pan the image if IG is busy!
+                }
+                if (Configs.KeyComboActions[KeyCombos.LeftRight] == AssignableActions.PrevNextImage) {
+                    e.Handled = true; // Issue #963: don't let ImageBox see the keystroke!
+                    _ = NextPicAsync(-1);
+                }
+                return; // fall-through lets pan happen
+            }
+            if (!ignore && e.KeyValue == (int)Keys.PageUp && hasNoMods) {
+                var action = Configs.KeyComboActions[KeyCombos.PageUpDown];
+                if (action == AssignableActions.PrevNextImage) {
+                    _ = NextPicAsync(-1);
+                }
+                else if (action == AssignableActions.ZoomInOut) {
+                    mnuMainZoomIn_Click(null, null);
+                }
+
                 return;
             }
             #endregion
 
 
-            //Next Image---------------------------------------------------------------------
+            // Next Image
             #region RIGHT ARROW / PAGE DOWN
-            if (!_isWindowsKeyPressed && !_isAppBusy && (e.KeyValue == 34 || e.KeyValue == 39) &&
-                !e.Control && !e.Shift && !e.Alt)//Right arrow / Pagedown
-            {
-                NextPic(1);
+            if (e.KeyValue == (int)Keys.Right && hasNoMods) {
+                if (ignore) {
+                    e.Handled = true; // Issue #963: leaning on the key will pan the image if IG is busy!
+                }
+                if (Configs.KeyComboActions[KeyCombos.LeftRight] == AssignableActions.PrevNextImage) {
+                    e.Handled = true; // Issue #963: don't let ImageBox see the keystroke!
+                    _ = NextPicAsync(1);
+                }
+                return; // fall-through lets pan happen
+            }
+            if (!ignore && e.KeyValue == (int)Keys.PageDown && hasNoMods) {
+                var action = Configs.KeyComboActions[KeyCombos.PageUpDown];
+                if (action == AssignableActions.PrevNextImage) {
+                    _ = NextPicAsync(1);
+                }
+                else if (action == AssignableActions.ZoomInOut) {
+                    mnuMainZoomOut_Click(null, null);
+                }
+
                 return;
             }
             #endregion
 
 
-            //Goto the first Image---------------------------------------------------------------
+            // Pan up
+            #region UP ARROW
+            if (!ignore && e.KeyValue == (int)Keys.Up && hasNoMods) {
+                if (Configs.KeyComboActions[KeyCombos.UpDown] == AssignableActions.ZoomInOut) {
+                    mnuMainZoomIn_Click(null, null);
+                    e.Handled = true;
+                }
+                return; // fall-through lets pan happen
+            }
+            #endregion
+
+
+            // Pan down
+            #region DOWN ARROW
+            if (!ignore && e.KeyValue == (int)Keys.Down && hasNoMods) {
+                if (Configs.KeyComboActions[KeyCombos.UpDown] == AssignableActions.ZoomInOut) {
+                    mnuMainZoomOut_Click(null, null);
+                    e.Handled = true;
+                }
+                return; // fall-through lets pan happen
+            }
+            #endregion
+
+
+            //Goto the first Image
             #region HOME
             if (!_isWindowsKeyPressed && e.KeyValue == 36 &&
-                !e.Control && !e.Shift && !e.Alt)
-            {
+                !e.Control && !e.Shift && !e.Alt) {
                 mnuMainGotoFirst_Click(null, e);
                 return;
             }
             #endregion
 
 
-            //Goto the last Image---------------------------------------------------------------
+            // Goto the last Image
             #region END
             if (!_isWindowsKeyPressed && e.KeyValue == 35 &&
-                !e.Control && !e.Shift && !e.Alt)
-            {
+                !e.Control && !e.Shift && !e.Alt) {
                 mnuMainGotoLast_Click(null, e);
                 return;
             }
             #endregion
 
+
+            // Ctrl
+            #region CTRL + ...
+            if (e.Control && !e.Alt && !e.Shift) // Ctrl
+            {
+                // Enable dragging viewing image to desktop feature---------------------------
+                _isDraggingImage = true;
+
+                // View previous image page
+                #region Ctrl + (previous)
+                if ((e.KeyValue == (int)Keys.Left
+                    && Configs.KeyComboActions[KeyCombos.LeftRight] == AssignableActions.PrevNextImage)
+                    || (e.KeyValue == (int)Keys.PageUp
+                    && Configs.KeyComboActions[KeyCombos.PageUpDown] == AssignableActions.PrevNextImage)
+                    ) {
+                    mnuMainPrevPage_Click(null, null);
+                    return;
+                }
+                #endregion
+
+                // View next image page
+                #region Ctrl + (next)
+                if ((e.KeyValue == (int)Keys.Right
+                    && Configs.KeyComboActions[KeyCombos.LeftRight] == AssignableActions.PrevNextImage)
+                    || (e.KeyValue == (int)Keys.PageDown
+                    && Configs.KeyComboActions[KeyCombos.PageUpDown] == AssignableActions.PrevNextImage)
+                    ) {
+                    mnuMainNextPage_Click(null, null);
+                    return;
+                }
+                #endregion
+
+                // View first image page
+                #region Ctrl + Home
+                if (!_isWindowsKeyPressed && e.KeyValue == 36) {
+                    mnuMainFirstPage_Click(null, null);
+                }
+                #endregion
+
+                // View last image page
+                #region Ctrl + End
+                if (!_isWindowsKeyPressed && e.KeyValue == 35) {
+                    mnuMainLastPage_Click(null, null);
+                }
+                #endregion
+
+                return;
+            }
+            #endregion
+
+
+            // Shift
+            #region Shift + ...
+            if (e.Shift && !e.Control && !e.Alt) {
+                // Shift+O: Loading order dropdown menu
+                if (e.KeyCode == Keys.O) {
+                    OpenShortcutMenu(mnuLoadingOrder);
+                    return;
+                }
+
+                // Shift+C: Channels dropdown menu
+                if (e.KeyCode == Keys.C) {
+                    OpenShortcutMenu(mnuMainChannels);
+                    return;
+                }
+            }
+            #endregion
+
+
+            // Without Modifiers keys 
+            #region Without Modifiers keys
+            if (hasNoMods) {
+                // Show main menu
+                if (e.KeyValue == 192) // `
+                {
+                    mnuMain.Show(toolMain, toolMain.Width - mnuMain.Width, toolMain.Height);
+                }
+
+                // Checkerboard background
+                if (e.KeyCode == Keys.B) {
+                    mnuMainCheckBackground.PerformClick();
+                    return;
+                }
+
+                // Crop tool
+                if (e.KeyCode == Keys.C) {
+                    mnuMainCrop.PerformClick();
+                    return;
+                }
+
+                // Open with
+                if (e.KeyCode == Keys.D) {
+                    mnuOpenWith_Click(null, null);
+                    return;
+                }
+
+                // Edit image
+                if (e.KeyCode == Keys.E) {
+                    mnuMainEditImage_Click(null, null);
+                    return;
+                }
+
+                // Go to...
+                if (e.KeyCode == Keys.G) {
+                    mnuMainGoto.PerformClick();
+                    return;
+                }
+
+                // Thumbnail bar
+                if (e.KeyCode == Keys.H) {
+                    mnuMainThumbnailBar.PerformClick();
+                    return;
+                }
+
+                // Color picker tool
+                if (e.KeyCode == Keys.K) {
+                    mnuMainColorPicker.PerformClick();
+                    return;
+                }
+
+                // Page naviagtion tool
+                if (e.KeyCode == Keys.P) {
+                    mnuMainPageNav.PerformClick();
+                    return;
+                }
+
+                // Refresh image
+                if (e.KeyCode == Keys.R) {
+                    mnuMainRefresh.PerformClick();
+                    return;
+                }
+
+                // Toolbar
+                if (e.KeyCode == Keys.T) {
+                    mnuMainToolbar.PerformClick();
+                    return;
+                }
+
+                // Exif tool
+                if (e.KeyCode == Keys.X) {
+                    mnuExifTool.PerformClick();
+                    return;
+                }
+
+                // Auto zoom
+                if (e.KeyValue == 49 || e.KeyCode == Keys.NumPad1) // Num1 / NumPad1
+                {
+                    mnuMainAutoZoom_Click(null, null);
+                    return;
+                }
+
+                // Lock zoom ratio
+                if (e.KeyValue == 50 || e.KeyCode == Keys.NumPad2) // Num2 / NumPad2
+                {
+                    mnuMainLockZoomRatio_Click(null, null);
+                    return;
+                }
+
+                // Scale to width
+                if (e.KeyValue == 51 || e.KeyCode == Keys.NumPad3) // Num3 / NumPad3
+                {
+                    mnuMainScaleToWidth_Click(null, null);
+                    return;
+                }
+
+                // Scale to height
+                if (e.KeyValue == 52 || e.KeyCode == Keys.NumPad4) // Num4 / NumPad4
+                {
+                    mnuMainScaleToHeight_Click(null, null);
+                    return;
+                }
+
+                // Scale to fit
+                if (e.KeyValue == 53 || e.KeyCode == Keys.NumPad5) // Num5 / NumPad5
+                {
+                    mnuMainScaleToFit_Click(null, null);
+                    return;
+                }
+
+                // Scale to fill
+                if (e.KeyValue == 54 || e.KeyCode == Keys.NumPad6) // Num6 / NumPad6
+                {
+                    mnuMainScaleToFill_Click(null, null);
+                    return;
+                }
+            }
+            #endregion
         }
 
-        private void frmMain_KeyUp(object sender, KeyEventArgs e)
-        {
+        private void frmMain_KeyUp(object sender, KeyEventArgs e) {
             //this.Text = e.KeyValue.ToString();
 
             //Ctrl---------------------------------------------------------------------------
@@ -1100,223 +1426,258 @@ namespace ImageGlass
             {
                 //Disable dragging viewing image to desktop feature--------------------------
                 _isDraggingImage = false;
-                
+
                 return;
             }
             #endregion
 
             //Start / stop slideshow---------------------------------------------------------
             #region SPACE
-            if (GlobalSetting.IsPlaySlideShow && e.KeyCode == Keys.Space && !e.Control && !e.Shift && !e.Alt)//SPACE
-            {
-                mnuMainSlideShowPause_Click(null, null);
+            var no_mods = !e.Control && !e.Shift && !e.Alt;
+            if (e.KeyCode == Keys.Space && no_mods) {
+                if (Configs.IsSlideshow) // Space always pauses slideshow if playing
+                {
+                    mnuMainSlideShowPause_Click(null, null);
+                }
+                else if (Configs.KeyComboActions[KeyCombos.SpaceBack] == AssignableActions.PrevNextImage) {
+                    _ = NextPicAsync(1);
+                }
                 return;
             }
             #endregion
-            
+
+
+            #region Backspace
+            if (e.KeyCode == Keys.Back && no_mods) {
+                if (Configs.KeyComboActions[KeyCombos.SpaceBack] == AssignableActions.PrevNextImage) {
+                    _ = NextPicAsync(-1);
+                }
+                return;
+            }
+            #endregion
         }
         #endregion
 
 
-
         #region Private functions
-        
+
         /// <summary>
-        /// Update editing association app info and icon for Edit Image menu
+        /// Handle the event when Dpi changed
         /// </summary>
-        private void UpdateEditingAssocAppInfoForMenu()
-        {
-            string appName = "";
+        private void OnDpiChanged() {
+            // Change grid cell size
+            picMain.GridCellSize = DPIScaling.Transform(Constants.VIEWER_GRID_SIZE);
+
+            // Change size of resize handlers
+            picMain.DragHandleSize = DPIScaling.Transform(8);
+
+            #region change size of toolbar
+            // Update size of toolbar
+            DPIScaling.TransformToolbar(ref toolMain, (int)Configs.ToolbarIconHeight);
+
+            // Update toolbar icon according to the new size
+            LoadToolbarIcons(forceReloadIcon: true);
+
+            #endregion
+
+            #region change size of menu items
+            var newMenuIconHeight = DPIScaling.Transform((int)Constants.MENU_ICON_HEIGHT);
+
+            mnuMainOpenFile.Image =
+                mnuMainZoomIn.Image =
+                mnuMainViewNext.Image =
+                mnuMainSlideShowStart.Image =
+                mnuMainRotateLeft.Image =
+
+                mnuMainClearClipboard.Image =
+                mnuMainToolbar.Image =
+                mnuMainColorPicker.Image =
+                mnuMainPageNav.Image =
+                mnuMainAbout.Image =
+                mnuMainSettings.Image =
+
+                mnuMainExtractPages.Image =
+
+                new Bitmap(newMenuIconHeight, newMenuIconHeight);
+
+            if (mnuMainChannels.DropDownItems.Count > 0) {
+                mnuMainChannels.DropDownItems[0].Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
+            }
+
+            if (mnuLoadingOrder.DropDownItems.Count > 0) {
+                mnuLoadingOrder.DropDownItems[0].Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
+            }
+
+            #endregion
+
+        }
+
+        /// <summary>
+        /// Update edit app info and icon for Edit Image menu
+        /// </summary>
+        private void UpdateEditAppInfoForMenu() {
+            var appName = "";
             mnuMainEditImage.Image = null;
-            
-            //Temporary memory data
-            if (LocalSetting.IsTempMemoryData)
-            { }
-            else
-            {
-                //Find file format
-                var ext = Path.GetExtension(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)).ToLower();
-                var assoc = GlobalSetting.GetImageEditingAssociationFromList(ext);
 
-                //Get App assoc info
-                if (assoc != null && File.Exists(assoc.AppPath))
-                {
-                    appName = $"({ assoc.AppName})";
+            // Temporary memory data
+            if (!Local.IsTempMemoryData) {
+                // Find file format
+                var ext = Path.GetExtension(Local.ImageList.GetFileName(Local.CurrentIndex)).ToLower();
+                var app = Configs.GetEditApp(ext);
 
-                    //Update icon
-                    Icon ico = Icon.ExtractAssociatedIcon(assoc.AppPath);
-                    double scaleFactor = DPIScaling.GetDPIScaleFactor();
-                    int iconWidth = (int)((int)Constants.MENU_ICON_HEIGHT * scaleFactor);
+                // Get EditApp info
+                if (app != null && File.Exists(app.AppPath)) {
+                    appName = $"({app.AppName})";
+
+                    // Update icon
+                    var ico = Icon.ExtractAssociatedIcon(app.AppPath);
+                    var iconWidth = DPIScaling.Transform(Constants.MENU_ICON_HEIGHT);
 
                     mnuMainEditImage.Image = new Bitmap(ico.ToBitmap(), iconWidth, iconWidth);
                 }
             }
 
-            mnuMainEditImage.Text = string.Format(GlobalSetting.LangPack.Items["frmMain.mnuMainEditImage"], appName);
+            mnuMainEditImage.Text = string.Format(Configs.Language.Items[$"{Name}.mnuMainEditImage"], appName);
         }
-        
 
         /// <summary>
         /// Select and Active Zoom Mode, use GlobalSetting.ZoomMode
         /// </summary>
-        private void SelectUIZoomMode()
-        {
+        private void SelectUIZoomMode() {
             // Reset (Disable) Zoom Lock
-            GlobalSetting.ZoomLockValue = 100.0;
+            Configs.ZoomLockValue = 100.0;
 
+            btnAutoZoom.Checked = mnuMainAutoZoom.Checked =
+                btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked =
+                btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked =
+                btnZoomLock.Checked = mnuMainLockZoomRatio.Checked =
+                btnScaleToFit.Checked = mnuMainScaleToFit.Checked =
+                btnScaleToFill.Checked = mnuMainScaleToFill.Checked = false;
 
-            switch (GlobalSetting.ZoomMode)
-            {
+            switch (Configs.ZoomMode) {
                 case ZoomMode.ScaleToFit:
                     btnScaleToFit.Checked = mnuMainScaleToFit.Checked = true;
-
-                    btnAutoZoom.Checked = mnuMainAutoZoom.Checked =
-                        btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked =
-                        btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked =
-                        btnZoomLock.Checked = mnuMainLockZoomRatio.Checked = false;
                     break;
 
                 case ZoomMode.ScaleToWidth:
                     btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked = true;
-
-                    btnAutoZoom.Checked = mnuMainAutoZoom.Checked =
-                        btnScaleToFit.Checked = mnuMainScaleToFit.Checked =
-                        btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked =
-                        btnZoomLock.Checked = mnuMainLockZoomRatio.Checked = false;
                     break;
 
                 case ZoomMode.ScaleToHeight:
                     btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked = true;
-
-                    btnAutoZoom.Checked = mnuMainAutoZoom.Checked =
-                        btnScaleToFit.Checked = mnuMainScaleToFit.Checked =
-                        btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked =
-                        btnZoomLock.Checked = mnuMainLockZoomRatio.Checked = false;
                     break;
 
                 case ZoomMode.LockZoomRatio:
                     btnZoomLock.Checked = mnuMainLockZoomRatio.Checked = true;
 
-                    btnAutoZoom.Checked = mnuMainAutoZoom.Checked =
-                        btnScaleToFit.Checked = mnuMainScaleToFit.Checked =
-                        btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked =
-                        btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked = false;
+                    // Enable Zoom Lock
+                    Configs.ZoomLockValue = picMain.Zoom;
+                    break;
 
-                    //Enable Zoom Lock
-                    GlobalSetting.ZoomLockValue = picMain.Zoom;
+                case ZoomMode.ScaleToFill:
+                    mnuMainScaleToFill.Checked = btnScaleToFill.Checked = true;
                     break;
 
                 case ZoomMode.AutoZoom:
                 default:
                     btnAutoZoom.Checked = mnuMainAutoZoom.Checked = true;
-
-                    btnScaleToFit.Checked = mnuMainScaleToFit.Checked =
-                        btnScaletoWidth.Checked = mnuMainScaleToWidth.Checked =
-                        btnScaletoHeight.Checked = mnuMainScaleToHeight.Checked =
-                        btnZoomLock.Checked = mnuMainLockZoomRatio.Checked = false;
-
                     break;
             }
         }
-
 
         /// <summary>
         /// Apply zoom mode
         /// </summary>
         /// <param name="zoomMode"></param>
         /// <param name="isResetScrollPosition"></param>
-        private void ApplyZoomMode(ZoomMode zoomMode, bool isResetScrollPosition = true)
-        {
+        private void ApplyZoomMode(ZoomMode zoomMode, bool isResetScrollPosition = true) {
+            if (picMain.Image == null) {
+                return;
+            }
+
             // Reset scrollbar position
-            if (isResetScrollPosition)
-            {
+            if (isResetScrollPosition) {
                 picMain.ScrollTo(0, 0, 0, 0);
             }
 
+            double frac;
+            switch (zoomMode) {
+                case ZoomMode.ScaleToWidth:
+                    frac = picMain.Width / (1f * picMain.Image.Width);
+                    picMain.Zoom = frac * 100;
+                    break;
 
-            if (zoomMode == ZoomMode.ScaleToWidth)
-            {
-                if (picMain.Image == null)
-                {
-                    return;
-                }
+                case ZoomMode.ScaleToHeight:
+                    frac = picMain.Height / (1f * picMain.Image.Height);
+                    picMain.Zoom = frac * 100;
+                    break;
 
-                // Scale to Width
-                double frac = picMain.Width / (1.0 * picMain.Image.Width);
-                picMain.Zoom = frac * 100;
+                case ZoomMode.ScaleToFit:
+                    picMain.ZoomToFit();
+                    break;
+
+                case ZoomMode.LockZoomRatio:
+                    picMain.Zoom = Configs.ZoomLockValue;
+                    break;
+
+                case ZoomMode.ScaleToFill:
+                    var widthRatio = picMain.Width / (1f * picMain.Image.Width);
+                    var heightRatio = picMain.Height / (1f * picMain.Image.Height);
+
+                    if (widthRatio > heightRatio) {
+                        frac = picMain.Width / (1f * picMain.Image.Width);
+                    }
+                    else {
+                        frac = picMain.Height / (1f * picMain.Image.Height);
+                    }
+
+                    picMain.Zoom = frac * 100;
+                    break;
+
+                case ZoomMode.AutoZoom:
+                default:
+                    picMain.ZoomAuto();
+                    break;
             }
-            else if (zoomMode == ZoomMode.ScaleToHeight)
-            {
-                if (picMain.Image == null)
-                {
-                    return;
-                }
 
-                // Scale to Height
-                double frac = picMain.Height / (1.0 * picMain.Image.Height);
-                picMain.Zoom = frac * 100;
-            }
-            else if (zoomMode == ZoomMode.ScaleToFit)
-            {
-                picMain.ZoomToFit();
-            }
-            else if (zoomMode == ZoomMode.LockZoomRatio)
-            {
-                picMain.Zoom = GlobalSetting.ZoomLockValue;
-            }
-            else //zoomMode == ZoomMode.AutoZoom
-            {
-                picMain.ZoomAuto();
+            if (Configs.IsCenterImage) {
+                // auto center the image
+                picMain.CenterToImage();
             }
 
-
-            // auto center the image
-            picMain.CenterToImage();
-
-            //Tell the app that it's not zoomed by user
+            // Tell the app that it's not zoomed by user
             _isManuallyZoomed = false;
 
-            //Get image file information
-            UpdateStatusBar();
+            // Get image file information
+            SetStatusBar();
         }
 
-        
         /// <summary>
         /// Start Zoom optimization
         /// </summary>
-        private void ZoomOptimization()
-        {
-            if (GlobalSetting.ZoomOptimizationMethod == ZoomOptimizationMethods.Auto)
-            {
-                if (picMain.Zoom > 100)
-                {
+        private void ZoomOptimization() {
+            if (Configs.ZoomOptimizationMethod == ZoomOptimizationMethods.Auto) {
+                if (picMain.Zoom > 100) {
                     picMain.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
                 }
-                else if (picMain.Zoom < 100)
-                {
+                else if (picMain.Zoom < 100) {
                     picMain.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
                 }
             }
-            else if (GlobalSetting.ZoomOptimizationMethod == ZoomOptimizationMethods.ClearPixels)
-            {
+            else if (Configs.ZoomOptimizationMethod == ZoomOptimizationMethods.ClearPixels) {
                 picMain.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
             }
-            else if (GlobalSetting.ZoomOptimizationMethod == ZoomOptimizationMethods.SmoothPixels)
-            {
+            else if (Configs.ZoomOptimizationMethod == ZoomOptimizationMethods.SmoothPixels) {
                 picMain.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
             }
         }
 
-
         /// <summary>
         /// Rename image
         /// </summary>
-        private void RenameImage()
-        {
-            try
-            {
-                if (GlobalSetting.IsImageError || !File.Exists(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)))
-                {
+        private void RenameImage() {
+            try {
+                if (Local.ImageError != null || !File.Exists(Local.ImageList.GetFileName(Local.CurrentIndex))) {
                     return;
                 }
             }
@@ -1326,116 +1687,109 @@ namespace ImageGlass
             // Replace original logic with the Path functions to access filename bits.
 
             // Extract the various bits of the image path
-            var filepath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-            string currentFolder = Path.GetDirectoryName(filepath);
-            string oldName  = Path.GetFileName(filepath);
-            string ext = Path.GetExtension(filepath);
-            string newName = Path.GetFileNameWithoutExtension(filepath);
+            var filepath = Local.ImageList.GetFileName(Local.CurrentIndex);
+            var currentFolder = Path.GetDirectoryName(filepath);
+            var oldName = Path.GetFileName(filepath);
+            var ext = Path.GetExtension(filepath);
+            var newName = Path.GetFileNameWithoutExtension(filepath);
 
-            //Show input box
-            string str = null;            
+            // Show input box
+            string str = null;
 
-            if (InputBox.ShowDiaLog(GlobalSetting.LangPack.Items["frmMain._RenameDialogText"], GlobalSetting.LangPack.Items["frmMain._RenameDialog"], newName, false) == DialogResult.OK)
-            {
+            if (InputBox.ShowDialog(
+                theme: Configs.Theme,
+                message: Configs.Language.Items[$"{Name}._RenameDialog"],
+                defaultValue: newName,
+                title: Configs.Language.Items[$"{Name}._RenameDialogText"],
+                topMost: this.TopMost,
+                isFilename: true) == DialogResult.OK) {
                 str = InputBox.Message;
             }
 
-            if (string.IsNullOrWhiteSpace(str))
-            {
+            if (string.IsNullOrWhiteSpace(str)) {
                 return;
             }
 
             newName = str + ext;
 
-            //duplicated name
-            if (oldName == newName)
-            {
+            // duplicated name
+            if (oldName == newName) {
                 return;
             }
 
-            try
-            {
-                string newFilePath = Path.Combine(currentFolder, newName);
-                //Rename file
+            try {
+                var newFilePath = Path.Combine(currentFolder, newName);
+                // Rename file
                 ImageInfo.RenameFile(filepath, newFilePath);
             }
-            catch (Exception ex)
-            {
+            catch (Exception ex) {
                 MessageBox.Show(ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
-
 
         /// <summary>
         /// Check and display message if the image still being loaded
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
-        private void LoadingMessageTimer_Tick(object sender, EventArgs e)
-        {
+        private void LoadingMessageTimer_Tick(object sender, EventArgs e) {
             var timer = (Timer)sender;
             timer.Enabled = false;
             timer.Stop();
             timer.Tick -= LoadingMessageTimer_Tick;
 
-            if (_isAppBusy)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items[$"{this.Name}._Loading"], 10000);
+            if (_isAppBusy) {
+                ShowToastMsg(Configs.Language.Items[$"{this.Name}._Loading"], 10000);
             }
 
             timer.Dispose();
         }
 
-
         /// <summary>
-        /// Display a message on picture box
+        /// Display a toast message on picture box
         /// </summary>
         /// <param name="msg">Message</param>
         /// <param name="duration">Duration (milisecond)</param>
-        private void DisplayTextMessage(string msg, int duration)
-        {
-            if (this.InvokeRequired)
-            {
-                this.Invoke(new Action<string, int>(DisplayTextMessage), msg, duration);
+        private void ShowToastMsg(string msg, int duration) {
+            if (!Configs.IsShowToast) return;
+
+            if (this.InvokeRequired) {
+                this.Invoke(new Action<string, int>(ShowToastMsg), msg, duration);
                 return;
             }
 
-            if (duration == 0)
-            {
+            if (duration == 0) {
                 picMain.TextBackColor = Color.Transparent;
                 picMain.Font = Font;
-                picMain.ForeColor = LocalSetting.Theme.TextInfoColor;
+                picMain.ForeColor = Theme.InvertBlackAndWhiteColor(Configs.BackgroundColor);
                 picMain.Text = string.Empty;
                 return;
             }
 
-            Timer tmsg = new Timer
-            {
-                Enabled = false
+            var timToast = new Timer {
+                Enabled = false,
+                Interval = duration, // display in xxx miliseconds
             };
-            tmsg.Tick += tmsg_Tick;
-            tmsg.Interval = duration; //display in xxx mili seconds
+            timToast.Tick += TimerToast_Tick;
 
             picMain.TextBackColor = Color.Black;
             picMain.Font = new Font(Font.FontFamily, 12);
             picMain.ForeColor = Color.White;
             picMain.Text = msg;
 
-            //Start timer
-            tmsg.Enabled = true;
-            tmsg.Start();
+            // Start timer
+            timToast.Enabled = true;
+            timToast.Start();
         }
-
 
         /// <summary>
         /// Timer Tick event: to display the message
         /// </summary>
-        private void tmsg_Tick(object sender, EventArgs e)
-        {
-            Timer tmsg = (Timer)sender;
-            tmsg.Stop();
-            tmsg.Tick -= tmsg_Tick;
-            tmsg.Dispose();
+        private void TimerToast_Tick(object sender, EventArgs e) {
+            var timToast = (Timer)sender;
+            timToast.Stop();
+            timToast.Tick -= TimerToast_Tick;
+            timToast.Dispose();
 
             picMain.TextBackColor = Color.Transparent;
             picMain.Font = Font;
@@ -1443,430 +1797,753 @@ namespace ImageGlass
             picMain.Text = string.Empty;
         }
 
-
         /// <summary>
         /// Copy multiple files
         /// </summary>
-        private void CopyMultiFiles()
-        {
-            //get filename
-            string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+        private void CopyMultiFiles() {
+            // get filename
+            var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
 
-            try
-            {
-                if (GlobalSetting.IsImageError || !File.Exists(filename))
-                {
+            try {
+                if (Local.ImageError != null || !File.Exists(filename)) {
                     return;
                 }
             }
             catch { return; }
 
-
             //update the list
             var fileList = new List<string>();
-            fileList.AddRange(LocalSetting.StringClipboard);
+            fileList.AddRange(Local.StringClipboard);
 
-            for (int i = 0; i < fileList.Count; i++)
-            {
-                if (!File.Exists(fileList[i]))
-                {
-                    LocalSetting.StringClipboard.Remove(fileList[i]);
+            for (var i = 0; i < fileList.Count; i++) {
+                if (!File.Exists(fileList[i])) {
+                    Local.StringClipboard.Remove(fileList[i]);
                 }
             }
 
-
-            //exit if duplicated filename
-            if (LocalSetting.StringClipboard.IndexOf(filename) == -1)
-            {
-                //add filename to clipboard
-                LocalSetting.StringClipboard.Add(filename);
+            // exit if duplicated filename
+            if (Local.StringClipboard.IndexOf(filename) == -1) {
+                // add filename to clipboard
+                Local.StringClipboard.Add(filename);
             }
 
             var fileDropList = new StringCollection();
-            fileDropList.AddRange(LocalSetting.StringClipboard.ToArray());
+            fileDropList.AddRange(Local.StringClipboard.ToArray());
 
             Clipboard.Clear();
             Clipboard.SetFileDropList(fileDropList);
 
-            DisplayTextMessage(
-                string.Format(GlobalSetting.LangPack.Items["frmMain._CopyFileText"],
-                LocalSetting.StringClipboard.Count), 1000);
+            ShowToastMsg(
+                string.Format(Configs.Language.Items[$"{Name}._CopyFileText"],
+                Local.StringClipboard.Count), 1000);
         }
-
 
         /// <summary>
         /// Cut multiple files
         /// </summary>
-        private void CutMultiFiles()
-        {
-            //get filename
-            string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+        private async Task CutMultiFilesAsync() {
+            // get filename
+            var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
 
-            try
-            {
-                if (GlobalSetting.IsImageError || !File.Exists(filename))
-                {
+            try {
+                if (Local.ImageError != null || !File.Exists(filename)) {
                     return;
                 }
             }
             catch { return; }
 
-
-            //update the list
+            // update the list
             var fileList = new List<string>();
-            fileList.AddRange(LocalSetting.StringClipboard);
+            fileList.AddRange(Local.StringClipboard);
 
-            for (int i = 0; i < fileList.Count; i++)
-            {
-                if (!File.Exists(fileList[i]))
-                {
-                    LocalSetting.StringClipboard.Remove(fileList[i]);
+            for (var i = 0; i < fileList.Count; i++) {
+                if (!File.Exists(fileList[i])) {
+                    Local.StringClipboard.Remove(fileList[i]);
                 }
             }
-            
 
-            //exit if duplicated filename
-            if (LocalSetting.StringClipboard.IndexOf(filename) == -1)
-            {
-                //add filename to clipboard
-                LocalSetting.StringClipboard.Add(filename);
+            // exit if duplicated filename
+            if (Local.StringClipboard.IndexOf(filename) == -1) {
+                // add filename to clipboard
+                Local.StringClipboard.Add(filename);
             }
-            
 
-            byte[] moveEffect = new byte[] { 2, 0, 0, 0 };
-            MemoryStream dropEffect = new MemoryStream();
-            dropEffect.Write(moveEffect, 0, moveEffect.Length);
+            var moveEffect = new byte[] { 2, 0, 0, 0 };
+            using (var dropEffect = new MemoryStream()) {
+                await dropEffect.WriteAsync(moveEffect, 0, moveEffect.Length).ConfigureAwait(true);
+                var fileDropList = new StringCollection();
+                fileDropList.AddRange(Local.StringClipboard.ToArray());
+                var data = new DataObject();
+                data.SetFileDropList(fileDropList);
+                data.SetData("Preferred DropEffect", dropEffect);
+                Clipboard.Clear();
+                Clipboard.SetDataObject(data, true);
+            }
 
-            var fileDropList = new StringCollection();
-            fileDropList.AddRange(LocalSetting.StringClipboard.ToArray());
-
-            DataObject data = new DataObject();
-            data.SetFileDropList(fileDropList);
-            data.SetData("Preferred DropEffect", dropEffect);
-            
-
-            Clipboard.Clear();
-            Clipboard.SetDataObject(data, true);
-
-            DisplayTextMessage(
-                string.Format(GlobalSetting.LangPack.Items["frmMain._CutFileText"],
-                LocalSetting.StringClipboard.Count), 1000);
+            ShowToastMsg(
+                string.Format(Configs.Language.Items[$"{Name}._CutFileText"],
+                Local.StringClipboard.Count), 1000);
         }
-
 
         /// <summary>
         /// Save all change of image
         /// </summary>
-        private void ImageSaveChange()
-        {
-            try
-            {
-                DateTime lastWriteTime = File.GetLastWriteTime(LocalSetting.ImageModifiedPath);
-                Interpreter.SaveImage(new Bitmap(picMain.Image), LocalSetting.ImageModifiedPath);
+        private async Task SaveImageChangeAsync() {
+            try {
+                var lastWriteTime = File.GetLastWriteTime(Local.ImageModifiedPath);
+                Bitmap newBitmap;
+
+                if (!picMain.SelectionRegion.IsEmpty) {
+                    newBitmap = new Bitmap(picMain.GetSelectedImage());
+                }
+                else {
+                    newBitmap = new Bitmap(picMain.Image);
+                }
+
+                // override the current image file
+                Heart.Photo.Save(newBitmap, Local.ImageModifiedPath, quality: Configs.ImageEditQuality);
 
                 // Issue #307: option to preserve the modified date/time
-                if (GlobalSetting.PreserveModifiedDate)
-                    File.SetLastWriteTime(LocalSetting.ImageModifiedPath, lastWriteTime);
+                if (Configs.IsPreserveModifiedDate) {
+                    File.SetLastWriteTime(Local.ImageModifiedPath, lastWriteTime);
+                }
+
+                // update cache of the modified item
+                var img = await Local.ImageList.GetImgAsync(Local.CurrentIndex).ConfigureAwait(true);
+                img.Image = newBitmap;
             }
-            catch (Exception)
-            {
-                MessageBox.Show(string.Format(GlobalSetting.LangPack.Items[$"{this.Name}._SaveImageError"], LocalSetting.ImageModifiedPath), "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            catch (Exception) {
+                MessageBox.Show(string.Format(Configs.Language.Items[$"{this.Name}._SaveImageError"], Local.ImageModifiedPath), "", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-            
-            LocalSetting.ImageModifiedPath = "";
+
+            Local.ImageModifiedPath = "";
         }
-
-
-        /// <summary>
-        /// Handle the event when Dpi changed
-        /// </summary>
-        private void OnDpiChanged()
-        {
-            //Change grid cell size
-            picMain.GridCellSize = DPIScaling.TransformNumber((int)Constants.VIEWER_GRID_SIZE);
-
-
-            #region change size of toolbar
-            //Update size of toolbar
-            toolMain.Height = DPIScaling.TransformNumber((int) Constants.TOOLBAR_HEIGHT);
-
-            //Get new toolbar item height
-            int currentToolbarHeight = toolMain.Height;
-            int newToolBarItemHeight = int.Parse(Math.Floor((currentToolbarHeight * 0.8)).ToString());
-
-            //Update toolbar items size
-            //Tool bar buttons
-            foreach (var item in toolMain.Items.OfType<ToolStripButton>())
-            {
-                item.Size = new Size(newToolBarItemHeight, newToolBarItemHeight);
-            }
-
-            //Tool bar menu buttons
-            foreach (var item in toolMain.Items.OfType<ToolStripDropDownButton>())
-            {
-                item.Size = new Size(newToolBarItemHeight, newToolBarItemHeight);
-            }
-
-            // get correct icon height
-            var hIcon = ThemeImage.GetCorrectIconHeight();
-
-            //Tool bar separators
-            foreach (var item in toolMain.Items.OfType<ToolStripSeparator>())
-            {
-                item.Size = new Size(5, (int)(hIcon * 1.2));
-                item.Margin = new Padding((int)(hIcon * 0.15), 0, (int)(hIcon * 0.15), 0);
-            }
-
-            //Update toolbar icon size
-            var themeName = GlobalSetting.GetConfig("Theme", "default");
-            Theme.Theme t = new Theme.Theme(GlobalSetting.ConfigDir(Dir.Themes, themeName));
-            LoadToolbarIcons(t);
-
-            #endregion
-
-
-            #region change size of menu items
-            int newMenuIconHeight = DPIScaling.TransformNumber((int)Constants.MENU_ICON_HEIGHT);
-
-            mnuMainAbout.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-            mnuMainViewNext.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-            mnuMainSlideShowStart.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-            mnuMainRotateCounterclockwise.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-
-            mnuMainClearClipboard.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-            mnuMainToolbar.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-            mnuMainColorPicker.Image = new Bitmap(newMenuIconHeight, newMenuIconHeight);
-
-            #endregion
-
-        }
-
 
         /// <summary>
         /// Load image data
         /// </summary>
         /// <param name="img"></param>
-        private void LoadImageData(Image img)
-        {
+        private void LoadImageData(Image img) {
             picMain.Image = img;
             picMain.Text = "";
-            LocalSetting.IsTempMemoryData = true;
+            Local.IsTempMemoryData = true;
 
-            UpdateStatusBar();
+            SetStatusBar();
         }
-
 
         /// <summary>
         /// Save current loaded image to file
         /// </summary>
-        private string SaveTemporaryMemoryData()
-        {
-            var tempDir = GlobalSetting.ConfigDir(Dir.Temporary);
-            if (!Directory.Exists(tempDir))
-            {
+        private string SaveTemporaryMemoryData() {
+            var tempDir = App.ConfigDir(PathType.Dir, Dir.Temporary);
+            if (!Directory.Exists(tempDir)) {
                 Directory.CreateDirectory(tempDir);
             }
 
-            string filename = Path.Combine(tempDir, "temp_" + DateTime.Now.ToString("yyyy-MM-dd-hh-mm-ss") + ".png");
+            var filename = Path.Combine(tempDir, "temp_" + DateTime.Now.ToString("yyyy-MM-dd-hh-mm-ss") + ".png");
 
             picMain.Image.Save(filename, ImageFormat.Png);
 
             return filename;
         }
 
-
         /// <summary>
-        /// Update toolbar buttons alignment
+        /// Determine the image sort order/direction based on user settings
+        /// or Windows Explorer sorting.
+        /// <param name="fullPath">full path to file/folder (i.e. as comes in from drag-and-drop)</param>
+        /// <side_effect>Updates GlobalSetting.ActiveImageLoadingOrder</side_effect>
+        /// <side_effect>Updates LocalSetting.ActiveImageLoadingOrder</side_effect>
+        /// <side_effect>Updates LocalSetting.ActiveImageLoadingOrderType</side_effect>
         /// </summary>
-        private void UpdateToolbarButtonsAlignment()
-        {
-            // Issue 425: option to center the toolbar buttons horizontally 
-            // [useful for wide screen]
-            // I'm assuming the btnMenu stays to the right, 
-            // in order to always be at a fixed location.
+        private static void DetermineSortOrder(string fullPath) {
+            // Initialize to the user-configured sorting order. Fetching the Explorer sort
+            // order may fail, or may be on an unsupported column.
+            Local.ActiveImageLoadingOrder = Configs.ImageLoadingOrder;
+            Local.ActiveImageLoadingOrderType = Configs.ImageLoadingOrderType;
 
-            var firstBtn = toolMain.Items[0];
-            var defaultMargin = new Padding(3, firstBtn.Margin.Top, firstBtn.Margin.Right, firstBtn.Margin.Bottom);
+            // Use File Explorer sort order if possible
+            if (Configs.IsUseFileExplorerSortOrder) {
+                if (ExplorerSortOrder.GetExplorerSortOrder(fullPath, out var explorerOrder, out var isAscending)) {
+                    if (explorerOrder != null) {
+                        Local.ActiveImageLoadingOrder = explorerOrder.Value;
+                    }
 
-            if (GlobalSetting.IsCenterToolbar)
-            {
-                // get the correct content width
-                var toolbarContentWidth = btnMenu.Width;
-                foreach (ToolStripItem item in toolMain.Items)
-                {
-                    toolbarContentWidth += item.Width;
-                }
-
-
-                // if the content cannot fit the toolbar size
-                if (toolbarContentWidth > toolMain.Size.Width)
-                {
-                    // align left
-                    firstBtn.Margin = defaultMargin;
-                }
-                else
-                {
-                    // the default margin (left alignment)
-                    var margin = defaultMargin;
-
-
-                    // get the gap of content width and toolbar width
-                    int gap = Math.Abs(toolMain.Width - toolbarContentWidth);
-
-                    // update the left margin value
-                    margin.Left = gap / 2;
-
-                    // align the first item
-                    firstBtn.Margin = margin;
+                    if (isAscending != null) {
+                        Local.ActiveImageLoadingOrderType = isAscending.Value ? ImageOrderType.Asc : ImageOrderType.Desc;
+                    }
                 }
             }
-            // if alignment is left
-            else
-            {
-                firstBtn.Margin = defaultMargin;
+        }
+
+        /// <summary>
+        /// Load View Channels menu items
+        /// </summary>
+        private void LoadViewChannelsMenuItems() {
+            // clear items
+            mnuMainChannels.DropDown.Items.Clear();
+
+            var newMenuIconHeight = DPIScaling.Transform(Constants.MENU_ICON_HEIGHT);
+
+            // add new items
+            foreach (var channel in Enum.GetValues(typeof(ColorChannels))) {
+                var channelName = Enum.GetName(typeof(ColorChannels), channel);
+                var mnu = new ToolStripRadioButtonMenuItem() {
+                    Text = Configs.Language.Items[$"{Name}.mnuMainChannels._{channelName}"],
+                    Tag = channel,
+                    CheckOnClick = true,
+                    Checked = (int)channel == (int)Local.Channels,
+                    ImageScaling = ToolStripItemImageScaling.None,
+                    Image = new Bitmap(newMenuIconHeight, newMenuIconHeight)
+                };
+
+                mnu.Click += this.MnuViewChannelsItem_Click;
+                mnuMainChannels.DropDown.Items.Add(mnu);
+            }
+        }
+
+        private void MnuViewChannelsItem_Click(object sender, EventArgs e) {
+            var mnu = sender as ToolStripMenuItem;
+            var selectedChannel = (ColorChannels)(int)mnu.Tag;
+
+            if (selectedChannel != Local.Channels) {
+                Local.Channels = selectedChannel;
+                Local.ImageList.Channels = (int)selectedChannel;
+
+                // update the viewing image
+                _ = NextPicAsync(0, true, true);
+
+                // update cached images
+                Local.ImageList.UpdateCache();
+
+                // reload state
+                LoadViewChannelsMenuItems();
             }
         }
 
 
         /// <summary>
-        /// Check and run an action if cursor position is the LEFT/CENTER/RIGHT side of picMain
+        /// Load Loading order menu items
         /// </summary>
-        /// <param name="location">Cursor Location</param>
-        /// <param name="onCursorLeftAction">Action to run if Cursor Position is LEFT</param>
-        /// <param name="onCursorCenterAction">Action to run if Cursor Position is CENTER</param>
-        /// <param name="onCursorRightAction">Action to run if Cursor Position is RIGHT</param>
-        private void CheckCursorPositionOnViewer(Point location, Action onCursorLeftAction = null, Action onCursorCenterAction = null, Action onCursorRightAction = null)
-        {
-            if (GlobalSetting.ImageList.Length > 1)
-            {
-                // calculate icon height
-                var iconHeight = DPIScaling.TransformNumber((int)Constants.TOOLBAR_ICON_HEIGHT * 3);
+        private void LoadLoadingOrderMenuItems() {
+            // clear items
+            mnuLoadingOrder.DropDown.Items.Clear();
 
-                // get the hotpot area width
-                var hotpotWidth = Math.Max(iconHeight, picMain.Width / 7);
+            var newMenuIconHeight = DPIScaling.Transform(Constants.MENU_ICON_HEIGHT);
 
-                // left side
-                if (location.X < hotpotWidth)
-                {
-                    // The first image in the list
-                    if (!GlobalSetting.IsLoopBackViewer && GlobalSetting.CurrentIndex == 0)
-                    {
-                        picMain.Cursor = _isAppBusy ? Cursors.WaitCursor : Cursors.Default;
-                    }
-                    else
-                    {
-                        onCursorLeftAction?.Invoke();
-                    }
+            // add new items
+            foreach (var order in Enum.GetValues(typeof(ImageOrderBy))) {
+                var orderName = Enum.GetName(typeof(ImageOrderBy), order);
+                var mnu = new ToolStripRadioButtonMenuItem() {
+                    Text = Configs.Language.Items[$"_.{nameof(ImageOrderBy)}._{orderName}"],
+                    Tag = order,
+                    CheckOnClick = true,
+                    Checked = (int)order == (int)Configs.ImageLoadingOrder,
+                    ImageScaling = ToolStripItemImageScaling.None,
+                    Image = new Bitmap(newMenuIconHeight, newMenuIconHeight)
+                };
+
+                mnu.Click += MnuLoadingOrderItem_Click;
+                mnuLoadingOrder.DropDown.Items.Add(mnu);
+            }
+        }
+
+
+        private void MnuLoadingOrderItem_Click(object sender, EventArgs e) {
+            var mnu = sender as ToolStripMenuItem;
+            var selectedOrder = (ImageOrderBy)(int)mnu.Tag;
+
+
+            if (selectedOrder != Configs.ImageLoadingOrder) {
+                Configs.ImageLoadingOrder = selectedOrder;
+
+                // reload image list
+                MnuMainReloadImageList_Click(null, null);
+
+                // reload the state
+                LoadLoadingOrderMenuItems();
+            }
+        }
+
+        /// <summary>
+        /// Load toolbar configs and update the buttons
+        /// </summary>
+        private void UpdateToolbarButtons() {
+            toolMain.Items.Clear();
+
+            // Update size of toolbar
+            var newBtnHeight = (int)Math.Floor(toolMain.Height * 0.8);
+
+            // get correct icon height
+            var hIcon = DPIScaling.Transform<uint>(Configs.ToolbarIconHeight);
+
+
+            foreach (var item in Configs.ToolbarButtons) {
+                if (item == ToolbarButton.Separator) {
+                    toolMain.Items.Add(new ToolStripSeparator {
+                        AutoSize = false,
+                        Height = (int)(hIcon * 1.2),
+                    });
                 }
-                // right side
-                else if (location.X > picMain.Width - hotpotWidth)
-                {
-                    // The last image in the list
-                    if (!GlobalSetting.IsLoopBackViewer && GlobalSetting.CurrentIndex >= GlobalSetting.ImageList.Length - 1)
-                    {
-                        picMain.Cursor = _isAppBusy ? Cursors.WaitCursor : Cursors.Default;
+                else {
+                    try {
+                        var info = typeof(frmMain).GetField(item.ToString(), BindingFlags.Instance | BindingFlags.NonPublic);
+                        var btn = info.GetValue(this) as ToolStripItem;
+
+                        // update the item size
+                        btn.Size = new Size(newBtnHeight, newBtnHeight);
+
+                        // add item to toolbar
+                        toolMain.Items.Add(btn);
                     }
-                    else
-                    {
-                        onCursorRightAction?.Invoke();
-                    }
+                    catch { }
                 }
-                // center
-                else
-                {
-                    onCursorCenterAction?.Invoke();
+            }
+        }
+
+        /// <summary>
+        /// Adjust our window dimensions to fit the image size.
+        /// </summary>
+        private void WindowFitMode() {
+            if (!Configs.IsWindowFit || picMain.Image == null)
+                return; // Nothing to do
+
+            // If the user selects "Display view scrollbars" setting, the imageviewer will
+            // try to take them into account [especially for tall images]. Override said
+            // setting in this mode.
+            var oldScrollSetting = picMain.HorizontalScrollBarStyle;
+            picMain.HorizontalScrollBarStyle = ImageBoxScrollBarStyle.Hide;
+            picMain.VerticalScrollBarStyle = ImageBoxScrollBarStyle.Hide;
+
+            WindowState = FormWindowState.Normal;
+
+            // get current screen
+            var screen = Screen.FromControl(this);
+
+            // First, adjust our main window to theoretically fit the entire
+            // picture, but not larger than desktop working area.
+            var fullW = Width + picMain.Image.Width - picMain.Width;
+            var fullH = Height + picMain.Image.Height - picMain.Height;
+
+            var maxWidth = Math.Min(fullW, screen.WorkingArea.Width);
+            var maxHeight = Math.Min(fullH, screen.WorkingArea.Height);
+            Size = new Size(Width = maxWidth, Height = maxHeight);
+
+            // Let the image viewer control figure out the zoom value for
+            // the full-size window
+            ApplyZoomMode(Configs.ZoomMode);
+
+            // Now that we have the new zoom value, adjust our main window
+            // to fit the *zoomed* image size
+            var newW = (int)(picMain.Image.Width * picMain.ZoomFactor);
+            var newH = (int)(picMain.Image.Height * picMain.ZoomFactor);
+
+            Size = new Size(Width += newW - picMain.Width,
+                            Height += newH - picMain.Height);
+
+            // center window to screen
+            if (Configs.IsCenterWindowFit
+                || fullW > screen.WorkingArea.Width
+                || fullH > screen.WorkingArea.Height) {
+                App.CenterFormToScreen(this);
+            }
+
+            picMain.Bounds = new Rectangle(0, 0, newW, newH);
+
+            // Restore the user's "Display viewer scrollbars" setting.
+            picMain.HorizontalScrollBarStyle = oldScrollSetting;
+            picMain.VerticalScrollBarStyle = oldScrollSetting;
+        }
+
+        /// <summary>
+        /// Paint countdown clock in Slideshow mode
+        /// </summary>
+        /// <param name="e"></param>
+        private void PaintSlideshowClock(PaintEventArgs e) {
+            if (!timSlideShow.Enabled || !Configs.IsShowSlideshowCountdown) {
+                return;
+            }
+
+            // draw countdown text ----------------------------------------------
+            var gap = DPIScaling.Transform(20);
+            var text = TimeSpan.FromSeconds(_slideshowCountdown).ToString("mm':'ss");
+
+            e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            using var textBrush = new SolidBrush(Color.FromArgb(150, Theme.InvertBlackAndWhiteColor(picMain.BackColor)));
+            var font = new Font(this.Font.FontFamily, 30f);
+            var fontSize = e.Graphics.MeasureString(text, font);
+
+            // calculate background size
+            var bgSize = new SizeF(fontSize.Width + gap, fontSize.Height + gap);
+            var bgX = picMain.Width - bgSize.Width - gap;
+            var bgY = picMain.Height - bgSize.Height - gap;
+
+            // calculate text size
+            var fontX = bgX + (bgSize.Width / 2) - (fontSize.Width / 2);
+            var fontY = bgY + (bgSize.Height / 2) - (fontSize.Height / 2);
+
+            // draw background
+            using var bgBrush = new SolidBrush(Color.FromArgb(150, picMain.BackColor));
+            e.Graphics.FillRectangle(bgBrush, bgX, bgY, bgSize.Width, bgSize.Height);
+
+            // draw countdown text
+            e.Graphics.DrawString(text, font, textBrush, fontX, fontY);
+        }
+
+        /// <summary>
+        /// Handle page navigation event
+        /// </summary>
+        /// <param name="navEvent"></param>
+        private void PageNavigationEvent(frmPageNav.NavEvent navEvent) {
+            switch (navEvent) {
+                case frmPageNav.NavEvent.PageFirst:
+                    mnuMainFirstPage_Click(null, null);
+                    break;
+
+                case frmPageNav.NavEvent.PageNext:
+                    mnuMainNextPage_Click(null, null);
+                    break;
+
+                case frmPageNav.NavEvent.PagePrevious:
+                    mnuMainPrevPage_Click(null, null);
+                    break;
+
+                case frmPageNav.NavEvent.PageLast:
+                    mnuMainLastPage_Click(null, null);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Handle cropping tool event
+        /// </summary>
+        /// <param name="actionEvent"></param>
+        private void CropActionEvent(frmCrop.CropActionEvent actionEvent) {
+            switch (actionEvent) {
+                case frmCrop.CropActionEvent.Save:
+                    _ = SaveImageChangeAsync();
+                    break;
+                case frmCrop.CropActionEvent.SaveAs:
+                    mnuMainSaveAs_Click(null, null);
+                    break;
+                case frmCrop.CropActionEvent.Copy:
+                    mnuMainCopyImageData_Click(null, null);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Show or hide Color picker tool
+        /// </summary>
+        /// <param name="show"></param>
+        private void ShowColorPickerTool(bool show = true) {
+            Local.IsColorPickerToolOpening =
+                mnuMainColorPicker.Checked = show;
+
+            // open Color Picker tool
+            if (show) {
+                if (Local.FColorPicker.IsDisposed) {
+                    Local.FColorPicker = new frmColorPicker();
                 }
+
+                Local.FColorPicker.SetToolFormManager(_toolManager);
+                Local.FColorPicker.Owner = this;
+                Local.ForceUpdateActions |= ForceUpdateActions.COLOR_PICKER_MENU;
+                Local.FColorPicker.SetImageBox(picMain);
+
+                if (!Local.FColorPicker.Visible) {
+                    Local.FColorPicker.Show(this);
+                }
+
+                this.Activate();
+            }
+            else {
+                // Close Color picker tool
+                Local.FColorPicker?.Close();
+            }
+        }
+
+        /// <summary>
+        /// Show or hide Page naviagtion tool
+        /// </summary>
+        /// <param name="show"></param>
+        private void ShowPageNavTool(bool show = true) {
+            Local.IsPageNavToolOpenning =
+                mnuMainPageNav.Checked = show;
+
+            if (!Configs.IsShowPageNavAuto) {
+                Configs.IsShowPageNavOnStartup = show;
+            }
+
+            if (show) {
+                // Open the page navigation tool
+                if (Local.FPageNav?.IsDisposed != false) {
+                    Local.FPageNav = new frmPageNav();
+                }
+
+                // register page event handler
+                Local.FPageNav.NavEventHandler = PageNavigationEvent;
+                Local.ForceUpdateActions |= ForceUpdateActions.PAGE_NAV_MENU;
+                Local.FPageNav.SetToolFormManager(_toolManager);
+                Local.FPageNav.Owner = this;
+
+                if (!Local.FPageNav.Visible) {
+                    Local.FPageNav.Show(this);
+                    SetStatusBar();
+                }
+
+                this.Activate();
+            }
+            else {
+                if (Local.FPageNav != null) {
+                    // Close the page navigation tool
+                    Local.FPageNav.Close();
+                    Local.FPageNav.NavEventHandler = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Enable / disable Crop tool
+        /// </summary>
+        /// <param name="show"></param>
+        public void ShowCropTool(bool show = true) {
+            btnCrop.Checked = mnuMainCrop.Checked = show;
+            picMain.SelectionMode = ImageBoxSelectionMode.None;
+            picMain.SelectNone();
+
+            // show Cropping mode
+            if (show) {
+                picMain.SelectionMode = ImageBoxSelectionMode.Rectangle;
+                picMain.SelectionRegion = new RectangleF();
+
+                // Open the page navigation tool
+                if (Local.FCrop?.IsDisposed != false) {
+                    Local.FCrop = new frmCrop();
+                }
+
+                // register page event handler
+                Local.FCrop.CropEventHandler = CropActionEvent;
+                Local.FCrop.SetToolFormManager(_toolManager);
+                Local.FCrop.Owner = this;
+                Local.FCrop.SetImageBox(picMain);
+
+                if (!Local.FCrop.Visible) {
+                    Local.FCrop.Show(this);
+                }
+
+                this.Activate();
+            }
+            else {
+                if (Local.FCrop != null) {
+                    // Close Crop tool
+                    Local.FCrop.Close();
+                    Local.FCrop.CropEventHandler = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets navigation regions
+        /// </summary>
+        /// <returns></returns>
+        private List<NavigationRegion> GetNavigationRegions() {
+            // get the nav region area width
+            var width = Math.Max(Configs.Theme.NavArrowLeft.Height, picMain.Width / 10);
+
+            return new List<NavigationRegion> {
+                new NavigationRegion() {
+                    Type = NavigationRegionType.Left,
+                    Region = new Rectangle(0, 0, width, picMain.Height),
+                },
+                new NavigationRegion() {
+                    Type = NavigationRegionType.Right,
+                    Region = new Rectangle(picMain.Width - width, 0, width, picMain.Height),
+                }
+            };
+        }
+
+        /// <summary>
+        /// Test if the given point is one of the left and right navigation regions
+        /// </summary>
+        /// <param name="point"></param>
+        /// <returns></returns>
+        private NavigationRegion TestCursorHitNavRegions(Point point) {
+            if (!Configs.IsShowNavigationButtons || picMain.IsPanning)
+                return null;
+
+            var item = Local.NavRegions.Find(item => item.Region.Contains(point));
+
+            // the given point is not in the hit regions
+            if (item == null)
+                return null;
+
+            // no loopback
+            if (!Configs.IsLoopBackViewer) {
+                // disable left arrow on first image
+                if (item.Type == NavigationRegionType.Left && Local.CurrentIndex == 0)
+                    return null;
+
+                // disable right arrow on last image
+                if (item.Type == NavigationRegionType.Right && Local.CurrentIndex >= Local.ImageList.Length - 1)
+                    return null;
+            }
+
+            return item;
+        }
+
+        /// <summary>
+        /// Paint left-right navigation regions
+        /// </summary>
+        /// <param name="e"></param>
+        private void PaintNavigationRegions(PaintEventArgs e) {
+            // get current cursor position on frmMain
+            var pos = this.PointToClient(MousePosition);
+            var navRegion = TestCursorHitNavRegions(pos);
+
+            // check if the hotspot hit
+            if (navRegion == null || navRegion.Type == NavigationRegionType.Unknown) return;
+
+            var region = navRegion.Region;
+            Image icon;
+
+            // expand rectangle by 1px to fit the drawable region
+            region.Offset(-1, -1);
+            region.Inflate(1, 1);
+
+            if (navRegion.Type == NavigationRegionType.Left) {
+                icon = Configs.Theme.NavArrowLeft;
+            }
+            else { // right
+                icon = Configs.Theme.NavArrowRight;
+            }
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.SetClip(region);
+
+            var iconPosX = region.X + (region.Width / 2) - (icon.Width / 2);
+            var iconPosY = (region.Height / 2) - (icon.Width / 2);
+
+            // draw circle background for icon
+            using var sBrush = new SolidBrush(Color.FromArgb(180, Configs.Theme.ToolbarBackgroundColor));
+            e.Graphics.FillEllipse(sBrush, new RectangleF(iconPosX, iconPosY, icon.Width, icon.Height));
+
+            // draw arrow icon
+            e.Graphics.DrawImage(icon, iconPosX, iconPosY);
+
+            e.Graphics.ResetClip();
+        }
+
+        /// <summary>
+        /// Invoke action after opening editing app
+        /// </summary>
+        private void RunActionAfterEditing() {
+            if (Configs.AfterEditingAction == AfterOpeningEditAppAction.Minimize) {
+                foreach (var frm in Application.OpenForms) {
+                    (frm as Form).WindowState = FormWindowState.Minimized;
+                }
+            }
+            else if (Configs.AfterEditingAction == AfterOpeningEditAppAction.Close) {
+                Application.Exit();
             }
         }
 
         #endregion
-
-
 
         #region Configurations
 
         /// <summary>
         /// Apply ImageGlass theme
         /// </summary>
-        /// <param name="themeFolderName">The folder name of theme. By default, load default theme</param>
-        private Theme.Theme ApplyTheme(string themeFolderName = "default")
-        {
-            Theme.Theme th = new Theme.Theme(GlobalSetting.ConfigDir(Dir.Themes, themeFolderName));
+        private void ApplyTheme(bool changeBackground = false) {
+            var th = Configs.Theme;
 
-            if (th.IsThemeValid)
-            {
-                GlobalSetting.SetConfig("Theme", themeFolderName);
+            // Apply theme
+            Configs.ApplyFormTheme(this, Configs.Theme);
+
+            // Remove white line under tool strip
+            toolMain.Renderer = new UI.Renderers.ToolStripRenderer(th.ToolbarBackgroundColor, th.TextInfoColor);
+
+            if (changeBackground) {
+                // User is changing theme. Override BackgroundColor setting.
+                picMain.BackColor = th.BackgroundColor;
+                Configs.BackgroundColor = th.BackgroundColor;
             }
-            LoadTheme(th);
 
-            return th;
+            picMain.GridColor = Color.FromArgb(15, 0, 0, 0);
+            picMain.GridColorAlternate = Color.FromArgb(20, 255, 255, 255);
 
-            void LoadTheme(Theme.Theme t)
-            {
-                // <main>
-                picMain.BackColor = t.BackgroundColor;
-                GlobalSetting.BackgroundColor = t.BackgroundColor;
+            toolMain.BackgroundImage = th.ToolbarBackgroundImage.Image;
+            toolMain.BackColor = th.ToolbarBackgroundColor;
 
-                picMain.GridColor = Color.FromArgb(15, 0, 0, 0);
-                picMain.GridColorAlternate = Color.FromArgb(20, 255, 255, 255);
+            thumbnailBar.BackgroundImage = th.ThumbnailBackgroundImage.Image;
+            thumbnailBar.BackColor = th.ThumbnailBackgroundColor;
+            sp1.BackColor = th.ThumbnailBackgroundColor;
 
-                toolMain.BackgroundImage = t.ToolbarBackgroundImage.Image;
-                toolMain.BackColor = t.ToolbarBackgroundColor;
+            lblInfo.ForeColor = th.TextInfoColor;
+            picMain.ForeColor = Theme.InvertBlackAndWhiteColor(Configs.BackgroundColor);
 
-                thumbnailBar.BackgroundImage = t.ThumbnailBackgroundImage.Image;
-                thumbnailBar.BackColor = t.ThumbnailBackgroundColor;
-                sp1.BackColor = t.ThumbnailBackgroundColor;
+            // Modern UI menu renderer
+            mnuMain.Renderer =
+                mnuShortcut.Renderer =
+                mnuContext.Renderer = new ModernMenuRenderer(th);
 
-                lblInfo.ForeColor = t.TextInfoColor;
-                picMain.ForeColor = Theme.Theme.InvertBlackAndWhiteColor(GlobalSetting.BackgroundColor);
+            // <toolbar_icon>
+            LoadToolbarIcons();
 
-                //Modern UI menu renderer
-                mnuMain.Renderer = mnuContext.Renderer = new ModernMenuRenderer(t.MenuBackgroundColor, t.MenuTextColor);
-
-                // <toolbar_icon>
-                LoadToolbarIcons(t);
-            }
+            // Overflow button and Overflow dropdown
+            toolMain.OverflowButton.DropDown.BackColor = th.ToolbarBackgroundColor;
+            toolMain.OverflowButton.AutoSize = false;
+            toolMain.OverflowButton.Padding = new Padding(DPIScaling.Transform(10));
         }
-
 
         /// <summary>
         /// Load toolbar icons
         /// </summary>
-        /// <param name="t">Theme</param>
-        private void LoadToolbarIcons(Theme.Theme t)
-        {
+        private void LoadToolbarIcons(bool forceReloadIcon = false) {
+            if (forceReloadIcon) {
+                Configs.Theme.ReloadIcons((int)Configs.ToolbarIconHeight);
+            }
+
+            var th = Configs.Theme;
+
             // <toolbar_icon>
-            btnBack.Image = t.ToolbarIcons.ViewPreviousImage.Image;
-            btnNext.Image = t.ToolbarIcons.ViewNextImage.Image;
+            btnBack.Image = th.ToolbarIcons.ViewPreviousImage.Image;
+            btnNext.Image = th.ToolbarIcons.ViewNextImage.Image;
 
-            btnRotateLeft.Image = t.ToolbarIcons.RotateLeft.Image;
-            btnRotateRight.Image = t.ToolbarIcons.RotateRight.Image;
-            btnFlipHorz.Image = t.ToolbarIcons.FlipHorz.Image;
-            btnFlipVert.Image = t.ToolbarIcons.FlipVert.Image;
-            btnDelete.Image = t.ToolbarIcons.Detele.Image;
+            btnRotateLeft.Image = th.ToolbarIcons.RotateLeft.Image;
+            btnRotateRight.Image = th.ToolbarIcons.RotateRight.Image;
+            btnFlipHorz.Image = th.ToolbarIcons.FlipHorz.Image;
+            btnFlipVert.Image = th.ToolbarIcons.FlipVert.Image;
+            btnDelete.Image = th.ToolbarIcons.Delete.Image;
+            btnEdit.Image = th.ToolbarIcons.Edit.Image;
+            btnCrop.Image = th.ToolbarIcons.Crop.Image;
+            btnColorPicker.Image = th.ToolbarIcons.ColorPicker.Image;
 
-            btnZoomIn.Image = t.ToolbarIcons.ZoomIn.Image;
-            btnZoomOut.Image = t.ToolbarIcons.ZoomOut.Image;
-            btnScaleToFit.Image = t.ToolbarIcons.ScaleToFit.Image;
-            btnActualSize.Image = t.ToolbarIcons.ActualSize.Image;
-            btnZoomLock.Image = t.ToolbarIcons.LockRatio.Image;
-            btnAutoZoom.Image = t.ToolbarIcons.AutoZoom.Image;
-            btnScaletoWidth.Image = t.ToolbarIcons.ScaleToWidth.Image;
-            btnScaletoHeight.Image = t.ToolbarIcons.ScaleToHeight.Image;
-            btnWindowAutosize.Image = t.ToolbarIcons.AdjustWindowSize.Image;
+            btnZoomIn.Image = th.ToolbarIcons.ZoomIn.Image;
+            btnZoomOut.Image = th.ToolbarIcons.ZoomOut.Image;
+            btnScaleToFit.Image = th.ToolbarIcons.ScaleToFit.Image;
+            btnActualSize.Image = th.ToolbarIcons.ActualSize.Image;
+            btnZoomLock.Image = th.ToolbarIcons.LockRatio.Image;
+            btnAutoZoom.Image = th.ToolbarIcons.AutoZoom.Image;
+            btnScaletoWidth.Image = th.ToolbarIcons.ScaleToWidth.Image;
+            btnScaletoHeight.Image = th.ToolbarIcons.ScaleToHeight.Image;
+            btnScaleToFill.Image = th.ToolbarIcons.ScaleToFill.Image;
+            btnWindowFit.Image = th.ToolbarIcons.AdjustWindowSize.Image;
 
-            btnOpen.Image = t.ToolbarIcons.OpenFile.Image;
-            btnRefresh.Image = t.ToolbarIcons.Refresh.Image;
-            btnGoto.Image = t.ToolbarIcons.GoToImage.Image;
+            btnOpen.Image = th.ToolbarIcons.OpenFile.Image;
+            btnRefresh.Image = th.ToolbarIcons.Refresh.Image;
+            btnGoto.Image = th.ToolbarIcons.GoToImage.Image;
 
-            btnThumb.Image = t.ToolbarIcons.ThumbnailBar.Image;
-            btnCheckedBackground.Image = t.ToolbarIcons.Checkerboard.Image;
-            btnFullScreen.Image = t.ToolbarIcons.FullScreen.Image;
-            btnSlideShow.Image = t.ToolbarIcons.Slideshow.Image;
-            btnConvert.Image = t.ToolbarIcons.Convert.Image;
-            btnPrintImage.Image = t.ToolbarIcons.Print.Image;
+            btnThumb.Image = th.ToolbarIcons.ThumbnailBar.Image;
+            btnCheckedBackground.Image = th.ToolbarIcons.Checkerboard.Image;
+            btnFullScreen.Image = th.ToolbarIcons.FullScreen.Image;
+            btnSlideShow.Image = th.ToolbarIcons.Slideshow.Image;
+            btnConvert.Image = th.ToolbarIcons.Convert.Image;
+            btnPrintImage.Image = th.ToolbarIcons.Print.Image;
 
-            btnMenu.Image = t.ToolbarIcons.Menu.Image;
+            btnMenu.Image = th.ToolbarIcons.Menu.Image;
         }
 
         /// <summary>
@@ -1889,578 +2566,207 @@ namespace ImageGlass
         /// <summary>
         /// Load app configurations
         /// </summary>
-        private void LoadConfig(bool @isLoadUI = false, bool @isLoadOthers = true)
-        {
-            //Stopwatch stopwatch = Stopwatch.StartNew();
-            string configValue = string.Empty;
-
+        private void LoadConfig(bool @isLoadUI = false, bool @isLoadOthers = true) {
             #region UI SETTINGS
-            if (isLoadUI)
-            {
+            if (isLoadUI) {
+                // ThumbnailBar Renderer must be done BEFORE loading theme
+                var thumbBarTheme = new ImageListView.ImageListViewRenderers.ThemeRenderer();
+                thumbnailBar.SetRenderer(thumbBarTheme);
+                ApplyTheme();
 
-                #region Load theme
-                thumbnailBar.SetRenderer(new ImageListView.ImageListViewRenderers.ThemeRenderer()); //ThumbnailBar Renderer must be done BEFORE loading theme
-                string themeFolderName = GlobalSetting.GetConfig("Theme", "default");
-                
-                LocalSetting.Theme = ApplyTheme(themeFolderName);
-                Application.DoEvents();
-                #endregion
-
-
-                #region Load checkerboard display mode
-                GlobalSetting.IsShowCheckerboardOnlyImageRegion = bool.Parse(GlobalSetting.GetConfig("IsShowCheckerboardOnlyImageRegion", "False"));
-                #endregion
-
-
-                #region Show checkerboard
-                GlobalSetting.IsShowCheckerBoard = bool.Parse(GlobalSetting.GetConfig("IsShowCheckedBackground", "False").ToString());
-                GlobalSetting.IsShowCheckerBoard = !GlobalSetting.IsShowCheckerBoard;
+                // Show checkerboard
+                Configs.IsShowCheckerBoard = !Configs.IsShowCheckerBoard;
                 mnuMainCheckBackground_Click(null, EventArgs.Empty);
-                #endregion
 
+                // background color
+                picMain.BackColor = Configs.BackgroundColor;
 
-                #region Load background
-                var bgValue = GlobalSetting.GetConfig("BackgroundColor", Theme.Theme.ConvertColorToHEX(LocalSetting.Theme.BackgroundColor));
-
-                GlobalSetting.BackgroundColor = Theme.Theme.ConvertHexStringToColor(bgValue, true);
-                picMain.BackColor = GlobalSetting.BackgroundColor;
-                #endregion
-
-
-                #region Load Toolbar buttons
-
-                GlobalSetting.ToolbarButtons = GlobalSetting.GetConfig("ToolbarButtons", GlobalSetting.ToolbarButtons);
-                LocalSetting.ForceUpdateActions |= MainFormForceUpdateAction.TOOLBAR;
-                frmMain_Activated(null, null);
-
-                #endregion
-
-
-                #region Load state of Toolbar 
-                GlobalSetting.IsShowToolBar = bool.Parse(GlobalSetting.GetConfig("IsShowToolBar", "True"));
-                GlobalSetting.IsShowToolBar = !GlobalSetting.IsShowToolBar;
+                // Load state of Toolbar 
+                Configs.IsShowToolBar = !Configs.IsShowToolBar;
                 mnuMainToolbar_Click(null, EventArgs.Empty);
-                #endregion
 
+                Application.DoEvents();
 
-                #region Load state of Toolbar Below Image
-                var vString = GlobalSetting.GetConfig("ToolbarPosition", ((int)GlobalSetting.ToolbarPosition).ToString());
-
-                if (Enum.TryParse(vString, out ToolbarPosition toolbarPos))
-                {
-                    GlobalSetting.ToolbarPosition = toolbarPos;
-
-                    //Request frmMain to update
-                    LocalSetting.ForceUpdateActions |= MainFormForceUpdateAction.TOOLBAR_POSITION;
-                    frmMain_Activated(null, EventArgs.Empty);
-                }
-                #endregion
-
-                
-                #region Load Thumbnail dimension
-                if (int.TryParse(GlobalSetting.GetConfig("ThumbnailDimension", GlobalSetting.ThumbnailDimension.ToString()), out int thumbDimension))
-                {
-                    GlobalSetting.ThumbnailDimension = thumbDimension;
-                }
-                else
-                {
-                    GlobalSetting.ThumbnailDimension = 48;
-                }
-                #endregion
-
-                
-                #region Load thumbnail bar width & position
-                if (!int.TryParse(GlobalSetting.GetConfig("ThumbnailBarWidth", "0"), out int tb_width))
-                {
-                    tb_width = 0;
+                // Load scrollbars visibility
+                if (Configs.IsScrollbarsVisible) {
+                    picMain.HorizontalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
+                    picMain.VerticalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
                 }
 
-                //Get minimum width needed for thumbnail dimension
-                var tb_minWidth = new ThumbnailItemInfo(GlobalSetting.ThumbnailDimension, true).GetTotalDimension();
-                //Get the greater width value
-                GlobalSetting.ThumbnailBarWidth = Math.Max(tb_width, tb_minWidth);
-
-                //Load thumbnail orientation state: 
-                //NOTE: needs to be done BEFORE the mnuMainThumbnailBar_Click invocation below!
-                GlobalSetting.IsThumbnailHorizontal = bool.Parse(GlobalSetting.GetConfig("IsThumbnailHorizontal", "True"));
-
-                //Load vertical thumbnail bar width
-                if (GlobalSetting.IsThumbnailHorizontal == false)
-                {
-                    if (int.TryParse(GlobalSetting.GetConfig("ThumbnailBarWidth", "48"), out int vtb_width))
-                    {
-                        GlobalSetting.ThumbnailBarWidth = vtb_width;
-                    }
-                }
-                #endregion
-                
-                
-                #region Load Thumbnail scrollbar visibility
-                if (bool.TryParse(GlobalSetting.GetConfig("IsShowThumbnailScrollbar", GlobalSetting.IsShowThumbnailScrollbar.ToString()), out bool showThumbScrollbar))
-                {
-                    GlobalSetting.IsShowThumbnailScrollbar = showThumbScrollbar;
-                }
-                #endregion
-
-
+                // Toolbar alignment and position
+                Local.ForceUpdateActions |= ForceUpdateActions.TOOLBAR_POSITION;
+                frmMain_Activated(null, EventArgs.Empty);
 
                 // NOTE: ***
                 // Need to load the Windows state here to fix the issue:
                 // https://github.com/d2phap/ImageGlass/issues/358
                 // And to IMPROVE the startup loading speed.
-                #region Windows Bound (Position + Size)
-                Rectangle rc = GlobalSetting.StringToRect(GlobalSetting.GetConfig($"{Name}.WindowsBound", "280,125,1000,800"));
+                var testWindowBound = Configs.FrmMainWindowBound;
+                testWindowBound.Inflate(-10, -10);
 
-                if (!Helper.IsOnScreen(rc.Location))
-                {
-                    rc.Location = new Point(280, 125);
+                if (Helpers.IsVisibleOnAnyScreen(testWindowBound)) {
+                    this.Bounds = Configs.FrmMainWindowBound;
                 }
-                this.Bounds = rc;
-                #endregion
+                else {
+                    // The saved position no longer exists (e.g. 2d monitor removed).
+                    // Prevent us from appearing off-screen.
+                    StartPosition = FormStartPosition.WindowsDefaultLocation;
+                }
 
-
-                // Issue #402: need to wait to load thumbnail size etc until after window bounds.
-                // The splitter dimensions may be too small for the user's last splitter bar position.
-                #region Load state of Thumbnail 
-                GlobalSetting.IsShowThumbnail = bool.Parse(GlobalSetting.GetConfig("IsShowThumbnail", "False"));
-                //GlobalSetting.IsShowThumbnail = !GlobalSetting.IsShowThumbnail;
-                //mnuMainThumbnailBar_Click(null, EventArgs.Empty);
-                LocalSetting.ForceUpdateActions |= MainFormForceUpdateAction.THUMBNAIL_BAR;
+                // Load state of Thumbnail
+                Local.ForceUpdateActions |= ForceUpdateActions.THUMBNAIL_BAR;
                 frmMain_Activated(null, EventArgs.Empty);
-                #endregion
-                
 
-                // Windows state must be loaded after Windows Bound!
-                #region Windows state
-                configValue = GlobalSetting.GetConfig($"{Name}.WindowsState", "Normal");
-                if (configValue == "Normal")
-                {
-                    this.WindowState = FormWindowState.Normal;
-                }
-                else if (configValue == "Maximized")
-                {
-                    this.WindowState = FormWindowState.Maximized;
+
+                #region Load Frameless mode
+                _movableForm = new MovableForm(this) {
+                    Key = Keys.ShiftKey | Keys.Shift,
+                    FreeMoveControlNames = new HashSet<string>()
+                    {
+                        nameof(toolMain),
+                        nameof(thumbnailBar),
+                    },
+                };
+
+                if (Configs.IsWindowFrameless) {
+                    Configs.IsWindowFrameless = !Configs.IsWindowFrameless;
+                    mnuFrameless.PerformClick();
                 }
                 #endregion
 
-                
             }
             #endregion
 
-
             #region OTHER SETTINGS
-            if (isLoadOthers)
-            {
+            if (isLoadOthers) {
                 // NOTE: ***
                 // This is a 'UI' setting which isLoadUI had previously skipped. *However*,
                 // the windows *Position* is the one UI setting which *must* be applied at
                 // the OnLoad event in order to 'take'.
-                #region Windows Bound (Position + Size)
-                Rectangle rc = GlobalSetting.StringToRect(GlobalSetting.GetConfig($"{Name}.WindowsBound", "280,125,1000,800"));
 
-                if (!Helper.IsOnScreen(rc.Location))
-                {
-                    rc.Location = new Point(280, 125);
-                }
-                this.Bounds = rc;
-                #endregion
-                
+                // Windows Bound (Position + Size)
+                this.Bounds = Configs.FrmMainWindowBound;
 
-                #region Load Toolbar button centering state
-                GlobalSetting.IsCenterToolbar = bool.Parse(GlobalSetting.GetConfig("IsCenterToolbar", GlobalSetting.IsCenterToolbar.ToString()));
-                #endregion
+                // Windows state must be loaded after Windows Bound!
+                this.WindowState = Configs.FrmMainWindowState;
 
 
-                #region Show NavigationButtons
-                GlobalSetting.IsShowNavigationButtons = bool.Parse(GlobalSetting.GetConfig("IsShowNavigationButtons", "False").ToString());
-                #endregion
+                // Load Toolbar buttons
+                // *** Need to trigger after 'this.Bounds'
+                Local.ForceUpdateActions |= ForceUpdateActions.TOOLBAR;
 
-                
-                #region Load language pack
-                configValue = GlobalSetting.GetConfig("Language", "English");
-                GlobalSetting.LangPack = new Language(configValue, GlobalSetting.StartUpDir(Dir.Languages));
-
-                //force update language pack
-                LocalSetting.ForceUpdateActions |= MainFormForceUpdateAction.LANGUAGE;
+                // force update language pack
+                Local.ForceUpdateActions |= ForceUpdateActions.LANGUAGE;
                 frmMain_Activated(null, null);
-                #endregion
 
-                
-                #region Read supported image formats
-                var extGroups = GlobalSetting.BuiltInImageFormats.Split("|".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);
-
-                //Load Default Image Formats
-                GlobalSetting.DefaultImageFormats = GlobalSetting.GetConfig("DefaultImageFormats", extGroups[0]);
-
-                //Load Optional Image Formats
-                GlobalSetting.OptionalImageFormats = GlobalSetting.GetConfig("OptionalImageFormats", extGroups[1]);
-
-                if (GlobalSetting.AllImageFormats.Length == 0)
-                {
-                    //If no formats from settings, we need to load from built-in configs
-                    GlobalSetting.LoadBuiltInImageFormats();
-
-                    //Write configs
-                    GlobalSetting.SetConfig("DefaultImageFormats", GlobalSetting.DefaultImageFormats);
-                    GlobalSetting.SetConfig("OptionalImageFormats", GlobalSetting.OptionalImageFormats);
-                }
-
-                // build the hashset GlobalSetting.ImageFormatHashSet
-                GlobalSetting.BuildImageFormatHashSet();
-                #endregion
-                
-
-                #region Recursive loading
-                GlobalSetting.IsRecursiveLoading = bool.Parse(GlobalSetting.GetConfig("IsRecursiveLoading", "False"));
-                #endregion
-
-
-                #region Show hidden images
-                GlobalSetting.IsShowingHiddenImages = bool.Parse(GlobalSetting.GetConfig("IsShowingHiddenImages", "False"));
-                #endregion
-
-
-                #region Load Color Management settings
-                GlobalSetting.IsApplyColorProfileForAll = bool.Parse(GlobalSetting.GetConfig("IsApplyColorProfileForAll", "False"));
-
-                // get color profile
-                GlobalSetting.ColorProfile = GlobalSetting.GetConfig("ColorProfile", GlobalSetting.ColorProfile);
-                GlobalSetting.ColorProfile = Interpreter.GetCorrectColorProfileName(GlobalSetting.ColorProfile);
-                #endregion
-
-
-                //Load image order config
-                GlobalSetting.ImageLoadingOrder = GlobalSetting.LoadImageOrderConfig();
-
-
-                //Load state of Image Booster
-                GlobalSetting.IsImageBoosterBack = bool.Parse(GlobalSetting.GetConfig("IsImageBoosterBack", "True"));
-
-
-                //Load IsDisplayBasenameOfImage value
-                GlobalSetting.IsDisplayBasenameOfImage = bool.Parse(GlobalSetting.GetConfig("IsDisplayBasenameOfImage", "False"));
-
-
-                #region Slideshow Interval
-                int i = int.Parse(GlobalSetting.GetConfig("SlideShowInterval", "5"));
-
-                if (!(0 < i && i < 61)) i = 5;//time limit [1; 60] seconds
-                GlobalSetting.SlideShowInterval = i;
-                timSlideShow.Interval = 1000 * GlobalSetting.SlideShowInterval;
-                #endregion
-
-                
                 #region Load Zoom Mode
-                GlobalSetting.ZoomMode = (ZoomMode)Enum.Parse(typeof(ZoomMode), GlobalSetting.GetConfig("ZoomMode", "0"));
-
 
                 // Load and Active Zoom Mode
+                picMain.Zoom = Configs.ZoomLockValue;
+
                 SelectUIZoomMode();
 
-
-                // Load Zoom Lock Value
-                int zoomLock = int.Parse(GlobalSetting.GetConfig("ZoomLockValue", "-1"), GlobalSetting.NumberFormat);
-                GlobalSetting.ZoomLockValue = zoomLock > 0 ? zoomLock : 100;
+                // Load ZoomLevels
+                picMain.ZoomLevels = new ImageBoxZoomLevelCollection(Configs.ZoomLevels);
 
                 #endregion
 
-
-                #region Load scrollbars visibility
-                GlobalSetting.IsScrollbarsVisible = bool.Parse(GlobalSetting.GetConfig("IsScrollbarsVisible", "False"));
-                if (GlobalSetting.IsScrollbarsVisible)
-                {
-                    picMain.HorizontalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
-                    picMain.VerticalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
+                // Load Color picker configs
+                if (Configs.IsShowColorPickerOnStartup) {
+                    ShowColorPickerTool();
                 }
-                #endregion
 
-
-                #region Load state of IsWindowAlwaysOnTop value 
-                GlobalSetting.IsWindowAlwaysOnTop = bool.Parse(GlobalSetting.GetConfig("IsWindowAlwaysOnTop", "False"));
-                this.TopMost = mnuMainAlwaysOnTop.Checked = GlobalSetting.IsWindowAlwaysOnTop;
-                #endregion
-                
-                
-                #region Load Color picker configs 
-                //Get Color code format
-                GlobalSetting.IsColorPickerRGBA = bool.Parse(GlobalSetting.GetConfig("IsColorPickerRGBA", "True"));
-                GlobalSetting.IsColorPickerHEXA = bool.Parse(GlobalSetting.GetConfig("IsColorPickerHEXA", "True"));
-                GlobalSetting.IsColorPickerHSLA = bool.Parse(GlobalSetting.GetConfig("IsColorPickerHSLA", "True"));
-
-
-                //Get IsShowColorPicker
-                LocalSetting.IsShowColorPickerOnStartup = bool.Parse(GlobalSetting.GetConfig("IsShowColorPickerOnStartup", "False"));
-                if (LocalSetting.IsShowColorPickerOnStartup)
-                {
-                    mnuMainColorPicker.PerformClick();
+                // Load Page navigation tool
+                if (Configs.IsShowPageNavOnStartup) {
+                    ShowPageNavTool();
                 }
-                #endregion
 
-
-                #region Load Full Screen mode
-                GlobalSetting.IsFullScreen = bool.Parse(GlobalSetting.GetConfig("IsFullScreen", "False"));
-                if (GlobalSetting.IsFullScreen)
-                {
-                    GlobalSetting.IsFullScreen = !GlobalSetting.IsFullScreen;
+                // Load Full Screen mode
+                if (Configs.IsFullScreen) {
+                    Configs.IsFullScreen = !Configs.IsFullScreen;
                     mnuMainFullScreen.PerformClick();
                 }
-                #endregion
 
+                // Load WindowFit mode
+                if (Configs.IsWindowFit) {
+                    Configs.IsWindowFit = !Configs.IsWindowFit;
+                    mnuWindowFit.PerformClick();
+                }
 
                 #region Get Last Seen Image Path & Welcome Image
-                GlobalSetting.IsOpenLastSeenImage = bool.Parse(GlobalSetting.GetConfig("IsOpenLastSeenImage", "False"));
-                GlobalSetting.IsShowWelcome = bool.Parse(GlobalSetting.GetConfig("IsShowWelcome", "True"));
+                var startUpImg = Configs.IsOpenLastSeenImage ? Configs.LastSeenImagePath : "";
 
-                var startUpImg = "";
-
-                if (GlobalSetting.IsOpenLastSeenImage)
-                {
-                    startUpImg = GlobalSetting.GetConfig("LastSeenImagePath");
+                if (!File.Exists(startUpImg) && Configs.IsShowWelcome) {
+                    startUpImg = App.StartUpDir("default.jpg");
                 }
 
-                if (!File.Exists(startUpImg) && GlobalSetting.IsShowWelcome)
-                {
-                    startUpImg = GlobalSetting.StartUpDir("default.jpg");
-                }
-
-                //Do not show welcome image if params exist.
-                if (Environment.GetCommandLineArgs().Count() < 2)
-                {
-                    Prepare(startUpImg);
+                // Do not show welcome image if params exist.
+                if (Environment.GetCommandLineArgs().Length < 2) {
+                    PrepareLoading(startUpImg);
                 }
                 #endregion
 
-                
-                //load other configs in another thread
-                Task.Run(() =>
-                {
-                    //Load IsLoopBackViewer
-                    GlobalSetting.IsLoopBackViewer = bool.Parse(GlobalSetting.GetConfig("IsLoopBackViewer", "True"));
 
-                    //Load IsLoopBackSlideShow
-                    GlobalSetting.IsLoopBackSlideShow = bool.Parse(GlobalSetting.GetConfig("IsLoopBackSlideShow", "True"));
+                // Load state of IsWindowAlwaysOnTop value 
+                this.TopMost = mnuMainAlwaysOnTop.Checked = Configs.IsWindowAlwaysOnTop;
 
-                    //Load IsPressESCToQuit
-                    GlobalSetting.IsPressESCToQuit = bool.Parse(GlobalSetting.GetConfig("IsPressESCToQuit", "True"));
-
-
-                    #region Zoom optimization method 
-                    string configValue2 = GlobalSetting.GetConfig("ZoomOptimization", "0");
-                    if (int.TryParse(configValue2, out int zoomValue))
-                    {
-                        if (-1 < zoomValue && zoomValue < Enum.GetNames(typeof(ZoomOptimizationMethods)).Length)
-                        { }
-                        else
-                        {
-                            zoomValue = 0;
-                        }
-                    }
-                    GlobalSetting.ZoomOptimizationMethod = (ZoomOptimizationMethods)zoomValue;
-                    #endregion
-
-
-                    #region Get mouse wheel settings 
-                    configValue2 = GlobalSetting.GetConfig("MouseWheelAction", "1");
-
-                    int mouseWheel;
-                    if (int.TryParse(configValue2, out mouseWheel))
-                    {
-                        if (Enum.IsDefined(typeof(MouseWheelActions), mouseWheel))
-                        { }
-                        else
-                        {
-                            mouseWheel = 1; //MouseWheelActions.ZOOM
-                        }
-                    }
-                    else
-                    {
-                        mouseWheel = 1;
-                    }
-                    GlobalSetting.MouseWheelAction = (MouseWheelActions)mouseWheel;
-
-                    configValue2 = GlobalSetting.GetConfig("MouseWheelCtrlAction", "1");
-                    if (int.TryParse(configValue2, out mouseWheel))
-                    {
-                        if (Enum.IsDefined(typeof(MouseWheelActions), mouseWheel))
-                        { }
-                        else
-                        {
-                            mouseWheel = 1; //MouseWheelActions.ZOOM
-                        }
-                    }
-                    else
-                    {
-                        mouseWheel = 1;
-                    }
-                    GlobalSetting.MouseWheelCtrlAction = (MouseWheelActions)mouseWheel;
-
-                    configValue2 = GlobalSetting.GetConfig("MouseWheelShiftAction", "1");
-                    if (int.TryParse(configValue2, out mouseWheel))
-                    {
-                        if (Enum.IsDefined(typeof(MouseWheelActions), mouseWheel))
-                        { }
-                        else
-                        {
-                            mouseWheel = 1; //MouseWheelActions.ZOOM
-                        }
-                    }
-                    else
-                    {
-                        mouseWheel = 1;
-                    }
-                    GlobalSetting.MouseWheelShiftAction = (MouseWheelActions)mouseWheel;
-
-                    configValue2 = GlobalSetting.GetConfig("MouseWheelAltAction", "1");
-                    if (int.TryParse(configValue2, out mouseWheel))
-                    {
-                        if (Enum.IsDefined(typeof(MouseWheelActions), mouseWheel))
-                        { }
-                        else
-                        {
-                            mouseWheel = 1; //MouseWheelActions.ZOOM
-                        }
-                    }
-                    else
-                    {
-                        mouseWheel = 1;
-                    }
-                    GlobalSetting.MouseWheelAltAction = (MouseWheelActions)mouseWheel;
-                    #endregion
-
-
-                    //Get IsConfirmationDelete value
-                    GlobalSetting.IsConfirmationDelete = bool.Parse(GlobalSetting.GetConfig("IsConfirmationDelete", "False"));
-
-
-                    //Get IsSaveAfterRotating value
-                    GlobalSetting.IsSaveAfterRotating = bool.Parse(GlobalSetting.GetConfig("IsSaveAfterRotating", "False"));
-
-                    // Fetch PreserveModifiedDate
-                    GlobalSetting.PreserveModifiedDate = bool.Parse(GlobalSetting.GetConfig("PreserveModifiedDate", "False"));
-
-
-                    #region Get ImageEditingAssociationList
-                    configValue2 = GlobalSetting.GetConfig("ImageEditingAssociationList", "");
-                    string[] editingAssoclist = configValue2.Split("[]".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);
-
-                    if (editingAssoclist.Length > 0)
-                    {
-                        foreach (var configString in editingAssoclist)
-                        {
-                            try
-                            {
-                                var extAssoc = new ImageEditingAssociation(configString);
-                                GlobalSetting.ImageEditingAssociationList.Add(extAssoc);
-                            }
-                            catch (InvalidCastException) { }
-                        }
-                    }
-                    #endregion
-
-
-                    //Get IsNewVersionAvailable
-                    GlobalSetting.IsNewVersionAvailable = bool.Parse(GlobalSetting.GetConfig("IsNewVersionAvailable", "False"));
-
-                });
-                
-
+                // Load state of WindowFit mode setting
+                mnuWindowFit.Checked = Configs.IsWindowFit;
+                WindowFitMode();
             }
             #endregion
 
-            //stopwatch.Stop();
-            //Console.WriteLine(">>>>> Elapsed = " + stopwatch.ElapsedMilliseconds);
         }
-
 
         /// <summary>
         /// Save app configurations
         /// </summary>
-        private void SaveConfig()
-        {
-            if (WindowState == FormWindowState.Normal)
-            {
-                // don't save Bound if in Full screen and SlideShow mode
-                if (!GlobalSetting.IsFullScreen && !GlobalSetting.IsPlaySlideShow)
-                {
-                    //Windows Bound--------------------------------------------------------------
-                    GlobalSetting.SetConfig($"{Name}.WindowsBound", GlobalSetting.RectToString(this.Bounds));
+        /// <param name="windowStateOnly">Only save window state</param>
+        private void SaveConfig(bool windowStateOnly = false) {
+            #region Window state and bounds
+            // Windows Bound---------------------------------------------
+            // don't save Bound if in Full screen and SlideShow mode
+            if (!Configs.IsFullScreen && !Configs.IsSlideshow) {
+                if (WindowState == FormWindowState.Normal) {
+                    Configs.FrmMainWindowBound = this.Bounds;
+                }
+                else if (WindowState == FormWindowState.Maximized) {
+                    // if moving a maximized window from a screen to other screen
+                    // and keep its maximized state, we need to save the "Normal"
+                    // location so that it restores to correct screen in Normal state
+                    // in the next run.
+                    var newLocation = this.Location;
+                    newLocation.Offset(110, 110);
+
+                    Configs.FrmMainWindowBound = new Rectangle(
+                        newLocation,
+                        Configs.FrmMainWindowBound.Size);
                 }
             }
 
-            //Windows State-------------------------------------------------------------------
-            GlobalSetting.SetConfig($"{Name}.WindowsState", WindowState.ToString());
+            // Windows State----------------------------------------------
+            Configs.FrmMainWindowState = this.WindowState != FormWindowState.Minimized ? this.WindowState : FormWindowState.Normal;
 
-            //Checked background
-            GlobalSetting.SetConfig("IsShowCheckedBackground", GlobalSetting.IsShowCheckerBoard.ToString());
-
-
-            #region  Toolbar state
-            if (!GlobalSetting.IsPlaySlideShow)
-            {
-                GlobalSetting.SetConfig("IsShowToolBar", GlobalSetting.IsShowToolBar.ToString());
-            }
-
-            GlobalSetting.SetConfig("IsShowThumbnailScroll", GlobalSetting.IsShowThumbnailScrollbar.ToString());
-            #endregion
-
-
-            //Window always on top
-            GlobalSetting.SetConfig("IsWindowAlwaysOnTop", GlobalSetting.IsWindowAlwaysOnTop.ToString());
-
-            //Zoom Mode
-            GlobalSetting.SetConfig("ZoomMode", GlobalSetting.ZoomMode.ToString());
-            
-            //Lock zoom ratio
-            GlobalSetting.SetConfig("ZoomLockValue", (GlobalSetting.ZoomMode == ZoomMode.LockZoomRatio) ? GlobalSetting.ZoomLockValue.ToString(GlobalSetting.NumberFormat) : "-1");
-
-
-            #region Thumbnail panel
-            if (!GlobalSetting.IsPlaySlideShow)
-            {
-                GlobalSetting.SetConfig("IsShowThumbnail", GlobalSetting.IsShowThumbnail.ToString());
+            if (windowStateOnly) {
+                return;
             }
             #endregion
 
 
-            // Save thumbnail bar orientation state
-            GlobalSetting.SetConfig("IsThumbnailHorizontal", GlobalSetting.IsThumbnailHorizontal.ToString());
+            // Save thumbnail bar width
+            Configs.ThumbnailBarWidth = (uint)(sp1.Width - sp1.SplitterDistance);
 
-            //Save thumbnail bar width
-            GlobalSetting.ThumbnailBarWidth = sp1.Width - sp1.SplitterDistance;
-            GlobalSetting.SetConfig("ThumbnailBarWidth", GlobalSetting.ThumbnailBarWidth.ToString(GlobalSetting.NumberFormat));
-
-            // Save vertical thumbnail bar width
-            if (GlobalSetting.IsThumbnailHorizontal == false)
-            {
-                GlobalSetting.SetConfig("ThumbnailBarWidth", (sp1.Width - sp1.SplitterDistance).ToString(GlobalSetting.NumberFormat));
-            }
-
-            //Save previous image if it was modified
-            if (File.Exists(LocalSetting.ImageModifiedPath) && GlobalSetting.IsSaveAfterRotating)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._SaveChanges"], 1000);
+            // Save previous image if it was modified
+            if (File.Exists(Local.ImageModifiedPath) && Configs.IsSaveAfterRotating) {
+                ShowToastMsg(Configs.Language.Items[$"{Name}._SaveChanges"], 1000);
 
                 Application.DoEvents();
-                ImageSaveChange();
+                _ = SaveImageChangeAsync();
             }
 
-            //Save IsShowColorPickerOnStartup
-            GlobalSetting.SetConfig("IsShowColorPickerOnStartup", LocalSetting.IsShowColorPickerOnStartup.ToString());
-
-            //Save toolbar buttons
-            GlobalSetting.SetConfig("ToolbarButtons", GlobalSetting.ToolbarButtons); // KBR
-
-
             // Save last seen image path
-            GlobalSetting.SetConfig("LastSeenImagePath", GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex));
-
-            // Save centering of toolbar buttons
-            GlobalSetting.SetConfig("IsCenterToolbar", GlobalSetting.IsCenterToolbar.ToString()); // KBR
-
-            // Save fullscreen state
-            GlobalSetting.SetConfig("IsFullScreen", GlobalSetting.IsFullScreen.ToString());
+            Configs.LastSeenImagePath = Local.ImageList.GetFileName(Local.CurrentIndex);
         }
-
 
         /// <summary>
         /// Enter or Exit Full screen mode
@@ -2468,660 +2774,789 @@ namespace ImageGlass
         /// <param name="enabled"></param>
         /// <param name="changeWindowState"></param>
         /// <param name="onlyShowViewer">Hide all layouts except main viewer</param>
-        private void FullScreenMode(bool enabled = true, bool changeWindowState = true, bool onlyShowViewer = false)
-        {
-            //full screen
-            if (enabled)
-            {
-                SaveConfig();
+        private void FullScreenMode(bool enabled = true, bool changeWindowState = true, bool onlyShowViewer = false) {
+            // full screen
+            if (enabled) {
+                SaveConfig(windowStateOnly: true);
 
-                //save last state of toolbar
-                if (onlyShowViewer)
-                {
-                    _isShowToolbar = GlobalSetting.IsShowToolBar;
-                    _isShowThumbnail = GlobalSetting.IsShowThumbnail;
+                _isFrameless = Configs.IsWindowFrameless;
+                _isWindowFit = Configs.IsWindowFit;
+
+                // exit WindowFit mode
+                Configs.IsWindowFit = true;
+                mnuWindowFit_Click(null, null);
+
+                // exit frameless window
+                Configs.IsWindowFrameless = true;
+                mnuFrameless_Click(null, null);
+
+                // save last state of layout
+                if (onlyShowViewer) {
+                    _isShowToolbar = Configs.IsShowToolBar;
+                    _isShowThumbnail = Configs.IsShowThumbnail;
                 }
 
-                if (changeWindowState)
-                {
+                if (changeWindowState) {
                     this.FormBorderStyle = FormBorderStyle.None;
                     this.WindowState = FormWindowState.Normal;
                     this.Bounds = Screen.FromControl(this).Bounds;
                 }
 
-                //Hide toolbar
-                if (onlyShowViewer)
-                {
+                // Hide toolbar
+                if (onlyShowViewer) {
                     toolMain.Visible = false;
-                    GlobalSetting.IsShowToolBar = false;
+                    Configs.IsShowToolBar = false;
                     mnuMainToolbar.Checked = false;
 
-                    //hide thumbnail
-                    GlobalSetting.IsShowThumbnail = true;
+                    // hide thumbnail
+                    Configs.IsShowThumbnail = true;
                     mnuMainThumbnailBar_Click(null, null);
                 }
 
                 Application.DoEvents();
 
-
-                //realign image
-                if (!_isManuallyZoomed)
-                {
-                    ApplyZoomMode(GlobalSetting.ZoomMode);
+                // realign image
+                if (!_isManuallyZoomed) {
+                    ApplyZoomMode(Configs.ZoomMode);
                 }
-
             }
 
-            //exit full screen
-            else
-            {
-                //restore last state of toolbar
-                if (onlyShowViewer)
-                {
-                    GlobalSetting.IsShowToolBar = _isShowToolbar;
-                    GlobalSetting.IsShowThumbnail = _isShowThumbnail;
+            // exit full screen
+            else {
+                // restore last state of toolbar
+                if (onlyShowViewer) {
+                    Configs.IsShowToolBar = _isShowToolbar;
+                    Configs.IsShowThumbnail = _isShowThumbnail;
                 }
 
                 // restore background color in case of being overriden by SlideShow mode
-                picMain.BackColor = GlobalSetting.BackgroundColor;
+                picMain.BackColor = Configs.BackgroundColor;
 
-                if (changeWindowState)
-                {
+                if (changeWindowState) {
                     this.FormBorderStyle = FormBorderStyle.Sizable;
 
-                    //windows state
-                    string state_str = GlobalSetting.GetConfig($"{Name}.WindowsState", "Normal");
-                    if (state_str == "Normal")
-                    {
-                        this.WindowState = FormWindowState.Normal;
-                    }
-                    else if (state_str == "Maximized")
-                    {
-                        this.WindowState = FormWindowState.Maximized;
+                    // windows state
+                    if (Configs.FrmMainWindowState != FormWindowState.Minimized) {
+                        this.WindowState = Configs.FrmMainWindowState;
                     }
 
-                    //Windows Bound (Position + Size)
-                    this.Bounds = GlobalSetting.StringToRect(GlobalSetting.GetConfig($"{Name}.WindowsBound", "280,125,750,545"));
+                    // Windows Bound (Position + Size)
+                    this.Bounds = Configs.FrmMainWindowBound;
                 }
 
+                // restore frameless state
+                Configs.IsWindowFrameless = _isFrameless;
+                if (Configs.IsWindowFrameless) {
+                    // trigger frameless window
+                    Configs.IsWindowFrameless = false;
+                    mnuFrameless_Click(null, null);
+                }
 
-                if (onlyShowViewer)
-                {
-                    if (GlobalSetting.IsShowToolBar)
-                    {
+                if (onlyShowViewer) {
+                    if (Configs.IsShowToolBar) {
                         //Show toolbar
                         toolMain.Visible = true;
                         mnuMainToolbar.Checked = true;
-
-                        UpdateToolbarButtonsAlignment();
                     }
 
-                    if (GlobalSetting.IsShowThumbnail)
-                    {
+                    if (Configs.IsShowThumbnail) {
                         //Show thumbnail
-                        GlobalSetting.IsShowThumbnail = false;
+                        Configs.IsShowThumbnail = false;
                         mnuMainThumbnailBar_Click(null, null);
                     }
                 }
 
+                // restore WindowFit mode state
+                Configs.IsWindowFit = _isWindowFit;
+                if (Configs.IsWindowFit) {
+                    Configs.IsWindowFit = false;
+                    mnuWindowFit_Click(null, null);
+                }
+
                 Application.DoEvents();
 
+                // Update toolbar icon according to the new size
+                LoadToolbarIcons(forceReloadIcon: true);
 
-                //realign image
-                if (!_isManuallyZoomed)
-                {
-                    ApplyZoomMode(GlobalSetting.ZoomMode);
+                toolMain.UpdateAlignment();
+
+                // realign image
+                if (!_isManuallyZoomed) {
+                    ApplyZoomMode(Configs.ZoomMode);
                 }
             }
         }
 
         #endregion
 
-
-
         #region Form events
-        protected override void WndProc(ref Message m)
-        {
-            //Check if the received message is WM_SHOWME
-            if (m.Msg == NativeMethods.WM_SHOWME)
-            {
-                //Set frmMain of the first instance to TopMost
-                if (WindowState == FormWindowState.Minimized)
-                {
+
+        protected override CreateParams CreateParams {
+            get {
+                // minimizable borderless form
+                const int WS_MINIMIZEBOX = 0x20000;
+
+                var cp = base.CreateParams;
+                cp.Style |= WS_MINIMIZEBOX;
+
+                return cp;
+            }
+        }
+
+        protected override void WndProc(ref Message m) {
+            var touchHandled = false;
+
+            // Check if the received message is WM_SHOWME
+            if (m.Msg == NativeMethods.WM_SHOWME) {
+                // Set frmMain of the first instance to TopMost
+                if (WindowState == FormWindowState.Minimized) {
                     WindowState = FormWindowState.Normal;
                 }
-                // get our current "TopMost" value (ours will always be false though)
-                bool top = TopMost;
-                // make our form jump to the top of everything
-                TopMost = true;
-                // set it back to whatever it was
-                TopMost = top;
+
+                // Issue #620: using TopMost/Focus doesn't give focus
+                BringToFront();
+                Activate();
             }
-            //This message is sent when the form is dragged to a different monitor i.e. when
-            //the bigger part of its are is on the new monitor. 
-            else if (m.Msg == DPIScaling.WM_DPICHANGED)
-            {
+
+            // This message is sent when the form is dragged to a different monitor i.e. when
+            // the bigger part of its are is on the new monitor. 
+            else if (m.Msg == DPIScaling.WM_DPICHANGED) {
                 DPIScaling.CurrentDPI = DPIScaling.LOWORD((int)m.WParam);
-                OnDpiChanged();                
+                OnDpiChanged();
             }
-            else if (m.Msg == 0x0112) // WM_SYSCOMMAND
-            {
+
+            // WM_SYSCOMMAND
+            else if (m.Msg == 0x0112) {
                 // When user clicks on MAXIMIZE button on title bar
-                if (m.WParam == new IntPtr(0xF030)) // Maximize event - SC_MAXIMIZE from Winuser.h
+                if (m.WParam == new IntPtr(0xF030)) // SC_MAXIMIZE
                 {
                     // The window is being maximized
-                    if (!_isManuallyZoomed)
-                    {
-                        ApplyZoomMode(GlobalSetting.ZoomMode);
+                    if (!_isManuallyZoomed) {
+                        ApplyZoomMode(Configs.ZoomMode);
                     }
                 }
                 // When user clicks on the RESTORE button on title bar
-                else if (m.WParam == new IntPtr(0xF120)) // Restore event - SC_RESTORE from Winuser.h
+                else if (m.WParam == new IntPtr(0xF120)) // SC_RESTORE
                 {
                     // The window is being restored
-                    if (!_isManuallyZoomed)
-                    {
-                        ApplyZoomMode(GlobalSetting.ZoomMode);
+                    if (!_isManuallyZoomed) {
+                        ApplyZoomMode(Configs.ZoomMode);
                     }
                 }
             }
-            
+
+            // Touch support
+            else if (m.Msg == Touch.WM_GESTURENOTIFY && Configs.IsUseTouchGesture) {
+                touchHandled = Touch.AcceptTouch(this);
+            }
+
+            // Touch support
+            else if (m.Msg == Touch.WM_GESTURE && Configs.IsUseTouchGesture) {
+                touchHandled = Touch.DecodeTouch(m, out var act);
+
+                switch (act) {
+                    case Touch.Action.SwipeLeft:
+                        _ = NextPicAsync(1);
+                        break;
+                    case Touch.Action.SwipeRight:
+                        _ = NextPicAsync(-1);
+                        break;
+                    case Touch.Action.RotateCCW:
+                        mnuMainRotateCounterclockwise_Click(null, null);
+                        break;
+                    case Touch.Action.RotateCW:
+                        mnuMainRotateClockwise_Click(null, null);
+                        break;
+                    case Touch.Action.ZoomIn:
+                        // Zoom in to a specific position
+                        for (var i = 0; i < Touch.ZoomFactor; i++)
+                            picMain.ProcessMouseZoom(true, Touch.ZoomLocation);
+                        break;
+                    case Touch.Action.ZoomOut:
+                        // Zoom out to a specific position
+                        for (var i = 0; i < Touch.ZoomFactor; i++)
+                            picMain.ProcessMouseZoom(false, Touch.ZoomLocation);
+                        break;
+                    case Touch.Action.SwipeUp:
+                        btnZoomOut_Click(null, null);
+                        break;
+                    case Touch.Action.SwipeDown:
+                        btnZoomIn_Click(null, null);
+                        break;
+                }
+            }
+
+            // Window frameless resizing
+            else if (m.Msg == 0x0084 && Configs.IsWindowFrameless) {
+                base.WndProc(ref m);
+
+                if ((int)m.Result == 0x01) // HTCLIENT
+                {
+                    var screenPoint = new Point(m.LParam.ToInt32());
+                    var clientPoint = this.PointToClient(screenPoint);
+
+                    const int RESIZE_HANDLE_SIZE = 10;
+
+                    if (clientPoint.Y <= RESIZE_HANDLE_SIZE) {
+                        if (clientPoint.X <= RESIZE_HANDLE_SIZE)
+                            m.Result = (IntPtr)13; // HTTOPLEFT
+                        else if (clientPoint.X < (Size.Width - RESIZE_HANDLE_SIZE))
+                            m.Result = (IntPtr)12; // HTTOP
+                        else
+                            m.Result = (IntPtr)14; // HTTOPRIGHT
+                    }
+                    else if (clientPoint.Y <= (Size.Height - RESIZE_HANDLE_SIZE)) {
+                        if (clientPoint.X <= RESIZE_HANDLE_SIZE)
+                            m.Result = (IntPtr)10; // HTLEFT
+                        else if (clientPoint.X < (Size.Width - RESIZE_HANDLE_SIZE))
+                            m.Result = (IntPtr)2; // HTCAPTION
+                        else
+                            m.Result = (IntPtr)11; // HTRIGHT
+                    }
+                    else {
+                        if (clientPoint.X <= RESIZE_HANDLE_SIZE)
+                            m.Result = (IntPtr)16; // HTBOTTOMLEFT
+                        else if (clientPoint.X < (Size.Width - RESIZE_HANDLE_SIZE))
+                            m.Result = (IntPtr)15; // HTBOTTOM
+                        else
+                            m.Result = (IntPtr)17; // HTBOTTOMRIGHT
+                    }
+                }
+                return;
+            }
+
+            // State changed
+            else if (m.Msg == 0x0005) // WM_SIZE
+            {
+            }
 
             base.WndProc(ref m);
+
+            if (touchHandled)
+                m.Result = new IntPtr(1);
         }
 
-
-
-        private void frmMain_Load(object sender, EventArgs e)
-        {
-            //Load Other Configs
+        private void frmMain_Load(object sender, EventArgs e) {
+            // Load Other Configs
             LoadConfig(isLoadUI: false, isLoadOthers: true);
-            
-            //Trigger Mouse Wheel event
-            picMain.MouseWheel += picMain_MouseWheel;
-            
 
-            //Try to use a faster image clock for animating GIFs
+            // Trigger Mouse Wheel event
+            picMain.MouseWheel += picMain_MouseWheel;
+
+
+            // Try to use a faster image clock for animating GIFs
             CheckAnimationClock(true);
 
-            //Load image from param
+            // Load image from param
             LoadFromParams(Environment.GetCommandLineArgs());
 
-            //Start thread to watching deleted files
-            System.Threading.Thread thDeleteWorker = new System.Threading.Thread(new System.Threading.ThreadStart(ThreadWatcherDeleteFiles))
-            {
+            // Start thread to watching deleted files
+            var thDeleteWorker = new System.Threading.Thread(new System.Threading.ThreadStart(ThreadWatcherDeleteFiles)) {
                 Priority = System.Threading.ThreadPriority.BelowNormal,
                 IsBackground = true
             };
             thDeleteWorker.Start();
-
-            // update the alignment of toolbar buttons
-            UpdateToolbarButtonsAlignment();
-
         }
 
-        public void LoadFromParams(string[] args)
-        {
-            //Load image from param
-            if (args.Length >= 2)
-            {
-                for (int i = 1; i < args.Length; i++)
-                {
-                    //only read the path, exclude configs parameter which starts with "--"
-                    if(!args[i].StartsWith("--"))
-                    {
-                        string filename = args[i];
 
-                        if (File.Exists(filename))
-                        {
-                            FileInfo f = new FileInfo(filename);
-                            Prepare(f.FullName);
-                        }
-                        else if (Directory.Exists(filename))
-                        {
-                            // Issue #415: If the folder name ends in ALT+255 (), DirectoryInfo strips it.
-                            // By ensuring a terminating slash, the problem disappears.
-                            // https://stackoverflow.com/questions/5368054/getdirectories-fails-to-enumerate-subfolders-of-a-folder-with-255-name
-                            if (!filename.EndsWith(Path.DirectorySeparatorChar.ToString()))
-                                filename += Path.DirectorySeparatorChar;
-
-                            DirectoryInfo d = new DirectoryInfo(filename);
-                            Prepare(d.FullName);
-                        }
-
+        public void LoadFromParams(string[] args) {
+            // Load image from param
+            if (args.Length >= 2) {
+                for (var i = 1; i < args.Length; i++) {
+                    // only read the path, exclude configs parameter which starts with "--"
+                    if (!args[i].StartsWith("--")) {
+                        PrepareLoading(args[i]);
                         break;
                     }
                 }
-                
             }
         }
 
-        private void frmMain_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            try
-            {
+        private void frmMain_FormClosing(object sender, FormClosingEventArgs e) {
+            try {
                 //stop the file system watcher
-                this._fileWatcher.Stop();
                 this._fileWatcher.Dispose();
 
                 //clear temp files
-                var tempDir = GlobalSetting.ConfigDir(Dir.Temporary);
-                if (Directory.Exists(tempDir))
-                {
+                var tempDir = App.ConfigDir(PathType.Dir, Dir.Temporary);
+                if (Directory.Exists(tempDir)) {
                     Directory.Delete(tempDir, true);
                 }
 
                 SaveConfig();
+
+                // Write user configs file
+                Configs.Write();
             }
             catch { }
         }
 
-        private void frmMain_Deactivate(object sender, EventArgs e)
-        {
-        }
+        private void frmMain_Activated(object sender, EventArgs e) {
+            var flags = Local.ForceUpdateActions;
 
-        private void frmMain_Activated(object sender, EventArgs e)
-        {
-            var flags = LocalSetting.ForceUpdateActions;
-
-            //do nothing
-            if (flags == MainFormForceUpdateAction.NONE) return;
-
+            // do nothing
+            if (flags == ForceUpdateActions.NONE) return;
 
             #region LANGUAGE
-            if ((flags & MainFormForceUpdateAction.LANGUAGE) == MainFormForceUpdateAction.LANGUAGE)
-            {
+            if ((flags & ForceUpdateActions.LANGUAGE) == ForceUpdateActions.LANGUAGE) {
+                var lang = Configs.Language.Items;
+
                 #region Update language strings
-                
-                //Toolbar
-                btnBack.ToolTipText = string.Format("{0} ({1})", GlobalSetting.LangPack.Items["frmMain.mnuMainViewPrevious"], GlobalSetting.LangPack.Items["frmMain.mnuMainViewPrevious.Shortcut"]);
-                btnNext.ToolTipText = string.Format("{0} ({1})", GlobalSetting.LangPack.Items["frmMain.mnuMainViewNext"], GlobalSetting.LangPack.Items["frmMain.mnuMainViewNext.Shortcut"]);
 
-                btnRotateLeft.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnRotateLeft"];
-                btnRotateRight.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnRotateRight"];
-                btnFlipHorz.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnFlipHorz"];
-                btnFlipVert.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnFlipVert"];
-                btnDelete.ToolTipText = $"{GlobalSetting.LangPack.Items["frmMain.mnuMainMoveToRecycleBin"]} ({mnuMainMoveToRecycleBin.ShortcutKeys.ToString()})";
-                btnZoomIn.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnZoomIn"];
-                btnZoomOut.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnZoomOut"];
-                btnAutoZoom.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnAutoZoom"];
-                btnScaleToFit.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnScaleToFit"];
-                btnActualSize.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnActualSize"];
-                btnZoomLock.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnZoomLock"];
-                btnScaletoWidth.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnScaletoWidth"];
-                btnScaletoHeight.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnScaletoHeight"];
-                btnWindowAutosize.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnWindowAutosize"];
-                btnOpen.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnOpen"];
-                btnRefresh.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnRefresh"];
-                btnGoto.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnGoto"];
-                btnThumb.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnThumb"];
-                btnCheckedBackground.ToolTipText = $"{GlobalSetting.LangPack.Items["frmMain.mnuMainCheckBackground"]} (Ctrl + B)"; ;
-                btnFullScreen.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnFullScreen"];
-                btnSlideShow.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnSlideShow"];
-                btnConvert.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnConvert"];
-                btnPrintImage.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnPrintImage"];
-                btnMenu.ToolTipText = GlobalSetting.LangPack.Items["frmMain.btnMenu"];
+                #region Main menu
 
-                //Main menu
-                mnuMainOpenFile.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainOpenFile"];
-                mnuMainOpenImageData.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainOpenImageData"];
-                mnuMainSaveAs.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSaveAs"];
-                mnuMainRefresh.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainRefresh"];
-                mnuMainReloadImage.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainReloadImage"];
-                mnuMainEditImage.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainEditImage"];
+                #region Menu File
+                mnuMainFile.Text = lang[$"{Name}.{nameof(mnuMainFile)}"];
+                mnuMainOpenFile.Text = lang[$"{Name}.{nameof(mnuMainOpenFile)}"];
+                mnuMainOpenImageData.Text = lang[$"{Name}.{nameof(mnuMainOpenImageData)}"];
+                mnuMainNewWindow.Text = lang[$"{Name}.{nameof(mnuMainNewWindow)}"];
+                mnuMainSaveAs.Text = lang[$"{Name}.{nameof(mnuMainSaveAs)}"];
+                mnuMainRefresh.Text = lang[$"{Name}.{nameof(mnuMainRefresh)}"];
+                mnuMainReloadImage.Text = lang[$"{Name}.{nameof(mnuMainReloadImage)}"];
+                mnuMainReloadImageList.Text = lang[$"{Name}.{nameof(mnuMainReloadImageList)}"];
+                mnuOpenWith.Text = lang[$"{Name}.{nameof(mnuOpenWith)}"];
+                mnuMainEditImage.Text = lang[$"{Name}.{nameof(mnuMainEditImage)}"];
+                mnuMainPrint.Text = lang[$"{Name}.{nameof(mnuMainPrint)}"];
+                #endregion
 
-                mnuMainNavigation.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainNavigation"];
-                mnuMainViewNext.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainViewNext"];
-                mnuMainViewNext.ShortcutKeyDisplayString = GlobalSetting.LangPack.Items["frmMain.mnuMainViewNext.Shortcut"];
+                #region Menu Navigation
+                mnuMainNavigation.Text = lang[$"{Name}.{nameof(mnuMainNavigation)}"];
+                mnuMainViewNext.Text = lang[$"{Name}.{nameof(mnuMainViewNext)}"];
+                mnuMainViewNext.ShortcutKeyDisplayString = lang[$"{Name}.{nameof(mnuMainViewNext)}.Shortcut"];
+                mnuMainViewPrevious.Text = lang[$"{Name}.{nameof(mnuMainViewPrevious)}"];
+                mnuMainViewPrevious.ShortcutKeyDisplayString = lang[$"{Name}.{nameof(mnuMainViewPrevious)}.Shortcut"];
 
-                mnuMainViewPrevious.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainViewPrevious"];
-                mnuMainViewPrevious.ShortcutKeyDisplayString = GlobalSetting.LangPack.Items["frmMain.mnuMainViewPrevious.Shortcut"];
+                mnuMainGoto.Text = lang[$"{Name}.{nameof(mnuMainGoto)}"];
+                mnuMainGotoFirst.Text = lang[$"{Name}.{nameof(mnuMainGotoFirst)}"];
+                mnuMainGotoLast.Text = lang[$"{Name}.{nameof(mnuMainGotoLast)}"];
 
-                mnuMainGoto.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainGoto"];
-                mnuMainGotoFirst.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainGotoFirst"];
-                mnuMainGotoLast.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainGotoLast"];
+                mnuMainNextPage.Text = lang[$"{Name}.{nameof(mnuMainNextPage)}"];
+                mnuMainPrevPage.Text = lang[$"{Name}.{nameof(mnuMainPrevPage)}"];
+                mnuMainFirstPage.Text = lang[$"{Name}.{nameof(mnuMainFirstPage)}"];
+                mnuMainLastPage.Text = lang[$"{Name}.{nameof(mnuMainLastPage)}"];
+                #endregion
 
-                mnuMainFullScreen.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainFullScreen"];
+                #region Menu Zoom
+                mnuMainZoom.Text = lang[$"{Name}.{nameof(mnuMainZoom)}"];
+                mnuMainZoomIn.Text = lang[$"{Name}.{nameof(mnuMainZoomIn)}"];
+                mnuMainZoomOut.Text = lang[$"{Name}.{nameof(mnuMainZoomOut)}"];
+                mnuMainScaleToFit.Text = lang[$"{Name}.{nameof(mnuMainScaleToFit)}"];
+                mnuMainScaleToFill.Text = lang[$"{Name}.{nameof(mnuMainScaleToFill)}"];
+                mnuMainActualSize.Text = lang[$"{Name}.{nameof(mnuMainActualSize)}"];
+                mnuMainLockZoomRatio.Text = lang[$"{Name}.{nameof(mnuMainLockZoomRatio)}"];
+                mnuMainAutoZoom.Text = lang[$"{Name}.{nameof(mnuMainAutoZoom)}"];
+                mnuMainScaleToWidth.Text = lang[$"{Name}.{nameof(mnuMainScaleToWidth)}"];
+                mnuMainScaleToHeight.Text = lang[$"{Name}.{nameof(mnuMainScaleToHeight)}"];
+                mnuWindowFit.Text = lang[$"{Name}.{nameof(mnuWindowFit)}"];
+                #endregion
 
-                mnuMainSlideShow.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSlideShow"];
-                mnuMainSlideShowStart.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSlideShowStart"];
-                mnuMainSlideShowPause.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSlideShowPause"];
-                mnuMainSlideShowExit.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSlideShowExit"];
+                #region Menu Image
+                mnuMainImage.Text = lang[$"{Name}.{nameof(mnuMainImage)}"];
+                mnuMainRotateLeft.Text = lang[$"{Name}.{nameof(mnuMainRotateLeft)}"];
+                mnuMainRotateRight.Text = lang[$"{Name}.{nameof(mnuMainRotateRight)}"];
+                mnuMainFlipHorz.Text = lang[$"{Name}.{nameof(mnuMainFlipHorz)}"];
+                mnuMainFlipVert.Text = lang[$"{Name}.{nameof(mnuMainFlipVert)}"];
 
-                mnuMainPrint.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainPrint"];
+                mnuMainRename.Text = lang[$"{Name}.{nameof(mnuMainRename)}"];
+                mnuMainMoveToRecycleBin.Text = lang[$"{Name}.{nameof(mnuMainMoveToRecycleBin)}"];
+                mnuMainDeleteFromHardDisk.Text = lang[$"{Name}.{nameof(mnuMainDeleteFromHardDisk)}"];
+                mnuMainExtractPages.Text = lang[$"{Name}.{nameof(mnuMainExtractPages)}"];
+                mnuMainStartStopAnimating.Text = lang[$"{Name}.{nameof(mnuMainStartStopAnimating)}"];
+                mnuMainSetAsDesktop.Text = lang[$"{Name}.{nameof(mnuMainSetAsDesktop)}"];
+                mnuMainSetAsLockImage.Text = lang[$"{Name}.{nameof(mnuMainSetAsLockImage)}"];
+                mnuMainImageLocation.Text = lang[$"{Name}.{nameof(mnuMainImageLocation)}"];
+                mnuMainImageProperties.Text = lang[$"{Name}.{nameof(mnuMainImageProperties)}"];
 
-                mnuMainManipulation.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainManipulation"];
-                mnuMainRotateCounterclockwise.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainRotateCounterclockwise"];
-                mnuMainRotateClockwise.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainRotateClockwise"];
-                mnuMainFlipHorz.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainFlipHorz"];
-                mnuMainFlipVert.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainFlipVert"];
-                mnuMainZoomIn.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainZoomIn"];
-                mnuMainZoomOut.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainZoomOut"];
-                mnuMainScaleToFit.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainScaleToFit"];
-                mnuMainActualSize.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainActualSize"];
-                mnuMainLockZoomRatio.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainLockZoomRatio"];
-                mnuMainAutoZoom.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainAutoZoom"];
-                mnuMainScaleToWidth.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainScaleToWidth"];
-                mnuMainScaleToHeight.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainScaleToHeight"];
-                mnuMainWindowAdaptImage.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainWindowAdaptImage"];
-                mnuMainRename.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainRename"];
-                mnuMainMoveToRecycleBin.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainMoveToRecycleBin"];
-                mnuMainDeleteFromHardDisk.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainDeleteFromHardDisk"];
-                mnuMainExtractFrames.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainExtractFrames"];
-                mnuMainStartStopAnimating.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainStartStopAnimating"];
-                mnuMainSetAsDesktop.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSetAsDesktop"];
-                mnuMainSetAsLockImage.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSetAsLockImage"];
-                mnuMainImageLocation.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainImageLocation"];
-                mnuMainImageProperties.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainImageProperties"];
+                mnuMainChannels.Text = lang[$"{Name}.{nameof(mnuMainChannels)}"];
+                LoadViewChannelsMenuItems(); // update Channels menu items
 
-                mnuMainClipboard.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainClipboard"];
-                mnuMainCopy.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCopy"];
-                mnuMainCopyImageData.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCopyImageData"];
-                mnuMainCut.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCut"];
-                mnuMainCopyImagePath.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCopyImagePath"];
-                mnuMainClearClipboard.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainClearClipboard"];
+                mnuLoadingOrder.Text = lang[$"{Name}.{nameof(mnuLoadingOrder)}"];
+                LoadLoadingOrderMenuItems(); // update Loading order items
+                #endregion
 
-                mnuMainShare.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainShare"];
+                #region Menu CLipboard
+                mnuMainClipboard.Text = lang[$"{Name}.{nameof(mnuMainClipboard)}"];
+                mnuMainCopy.Text = lang[$"{Name}.{nameof(mnuMainCopy)}"];
+                mnuMainCopyImageData.Text = lang[$"{Name}.{nameof(mnuMainCopyImageData)}"];
+                mnuMainCut.Text = lang[$"{Name}.{nameof(mnuMainCut)}"];
+                mnuMainCopyImagePath.Text = lang[$"{Name}.{nameof(mnuMainCopyImagePath)}"];
+                mnuMainClearClipboard.Text = lang[$"{Name}.{nameof(mnuMainClearClipboard)}"];
+                #endregion
 
-                mnuMainLayout.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainLayout"];
-                mnuMainToolbar.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainToolbar"];
-                mnuMainThumbnailBar.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainThumbnailBar"];
-                mnuMainCheckBackground.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCheckBackground"];
-                mnuMainAlwaysOnTop.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainAlwaysOnTop"];
+                #region Menu Slideshow
+                mnuMainSlideShow.Text = lang[$"{Name}.{nameof(mnuMainSlideShow)}"];
+                mnuMainSlideShowStart.Text = lang[$"{Name}.{nameof(mnuMainSlideShowStart)}"];
+                mnuMainSlideShowPause.Text = lang[$"{Name}.{nameof(mnuMainSlideShowPause)}"];
+                mnuMainSlideShowExit.Text = lang[$"{Name}.{nameof(mnuMainSlideShowExit)}"];
+                #endregion
 
-                mnuMainTools.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainTools"];
-                mnuMainColorPicker.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainColorPicker"];
+                #region Menu Layout
+                mnuMainLayout.Text = lang[$"{Name}.{nameof(mnuMainLayout)}"];
+                mnuMainToolbar.Text = lang[$"{Name}.{nameof(mnuMainToolbar)}"];
+                mnuMainThumbnailBar.Text = lang[$"{Name}.{nameof(mnuMainThumbnailBar)}"];
+                mnuMainCheckBackground.Text = lang[$"{Name}.{nameof(mnuMainCheckBackground)}"];
+                mnuMainAlwaysOnTop.Text = lang[$"{Name}.{nameof(mnuMainAlwaysOnTop)}"];
+                #endregion
 
-                mnuMainSettings.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainSettings"];
-                mnuMainAbout.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainAbout"];
+                #region Menu Tools
+                mnuMainTools.Text = lang[$"{Name}.{nameof(mnuMainTools)}"];
+                mnuMainColorPicker.Text = lang[$"{Name}.{nameof(mnuMainColorPicker)}"];
+                mnuMainPageNav.Text = lang[$"{Name}.{nameof(mnuMainPageNav)}"];
+                mnuMainCrop.Text = lang[$"{Name}.{nameof(mnuMainCrop)}"];
+                mnuExifTool.Text = lang[$"{Name}.{nameof(mnuExifTool)}"];
+                #endregion
 
-                mnuMainFirstLaunch.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainFirstLaunch"];
-                mnuMainReportIssue.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainReportIssue"];
+                #region Menu Help
+                mnuMainHelp.Text = lang[$"{Name}.{nameof(mnuMainHelp)}"];
+                mnuMainAbout.Text = lang[$"{Name}.{nameof(mnuMainAbout)}"];
+                mnuMainFirstLaunch.Text = lang[$"{Name}.{nameof(mnuMainFirstLaunch)}"];
+                mnuMainReportIssue.Text = lang[$"{Name}.{nameof(mnuMainReportIssue)}"];
+                #endregion
+
+                mnuMainFullScreen.Text = lang[$"{Name}.{nameof(mnuMainFullScreen)}"];
+                mnuFrameless.Text = lang[$"{Name}.{nameof(mnuFrameless)}"];
+                mnuMainShare.Text = lang[$"{Name}.{nameof(mnuMainShare)}"];
+
+                mnuMainSettings.Text = lang[$"{Name}.{nameof(mnuMainSettings)}"];
+                mnuMainExitApplication.Text = lang[$"{Name}.{nameof(mnuMainExitApplication)}"];
+
+                #endregion
+
+                #region Toolbar
+
+                btnBack.ToolTipText = mnuMainViewPrevious.Text + $" ({mnuMainViewPrevious.ShortcutKeyDisplayString})";
+                btnNext.ToolTipText = mnuMainViewNext.Text + $" ({mnuMainViewNext.ShortcutKeyDisplayString})";
+
+                // Edit
+                btnRotateLeft.ToolTipText = mnuMainRotateLeft.Text + $" ({mnuMainRotateLeft.ShortcutKeyDisplayString})";
+                btnRotateRight.ToolTipText = mnuMainRotateRight.Text + $" ({mnuMainRotateRight.ShortcutKeyDisplayString})";
+                btnFlipHorz.ToolTipText = mnuMainFlipHorz.Text + $" ({mnuMainFlipHorz.ShortcutKeyDisplayString})";
+                btnFlipVert.ToolTipText = mnuMainFlipVert.Text + $" ({mnuMainFlipVert.ShortcutKeyDisplayString})";
+                btnDelete.ToolTipText = mnuMainMoveToRecycleBin.Text + $" ({mnuMainMoveToRecycleBin.ShortcutKeyDisplayString})";
+                btnEdit.ToolTipText = string.Format(mnuMainEditImage.Text, "") + $" ({mnuMainEditImage.ShortcutKeyDisplayString})";
+                btnCrop.ToolTipText = string.Format(mnuMainCrop.Text, "") + $" ({mnuMainCrop.ShortcutKeyDisplayString})";
+                btnColorPicker.ToolTipText = string.Format(mnuMainColorPicker.Text, "") + $" ({mnuMainColorPicker.ShortcutKeyDisplayString})";
+
+                // Zooming
+                btnZoomIn.ToolTipText = mnuMainZoomIn.Text + $" ({mnuMainZoomIn.ShortcutKeyDisplayString})";
+                btnZoomOut.ToolTipText = mnuMainZoomOut.Text + $" ({mnuMainZoomOut.ShortcutKeyDisplayString})";
+                btnActualSize.ToolTipText = mnuMainActualSize.Text + $" ({mnuMainActualSize.ShortcutKeyDisplayString})";
+
+                // Zoom modes
+                btnAutoZoom.ToolTipText = mnuMainAutoZoom.Text + $" ({mnuMainAutoZoom.ShortcutKeyDisplayString})";
+                btnScaletoWidth.ToolTipText = mnuMainScaleToWidth.Text + $" ({mnuMainScaleToWidth.ShortcutKeyDisplayString})";
+                btnScaletoHeight.ToolTipText = mnuMainScaleToHeight.Text + $" ({mnuMainScaleToHeight.ShortcutKeyDisplayString})";
+                btnScaleToFit.ToolTipText = mnuMainScaleToFit.Text + $" ({mnuMainScaleToFit.ShortcutKeyDisplayString})";
+                btnScaleToFill.ToolTipText = mnuMainScaleToFill.Text + $" ({mnuMainScaleToFill.ShortcutKeyDisplayString})";
+                btnZoomLock.ToolTipText = mnuMainLockZoomRatio.Text + $" ({mnuMainLockZoomRatio.ShortcutKeyDisplayString})";
+
+                // Window modes
+                btnWindowFit.ToolTipText = mnuWindowFit.Text + $" ({mnuWindowFit.ShortcutKeyDisplayString})";
+                btnFullScreen.ToolTipText = mnuMainFullScreen.Text + $" ({mnuMainFullScreen.ShortcutKeyDisplayString})";
+                btnSlideShow.ToolTipText = mnuMainSlideShowStart.Text + $" ({mnuMainSlideShowStart.ShortcutKeyDisplayString})";
+
+                // File
+                btnOpen.ToolTipText = mnuMainOpenFile.Text + $" ({mnuMainOpenFile.ShortcutKeyDisplayString})";
+                btnRefresh.ToolTipText = mnuMainRefresh.Text + $" ({mnuMainRefresh.ShortcutKeyDisplayString})";
+                btnGoto.ToolTipText = mnuMainGoto.Text + $" ({mnuMainGoto.ShortcutKeyDisplayString})";
+
+                // Layout
+                btnThumb.ToolTipText = mnuMainThumbnailBar.Text + $" ({mnuMainThumbnailBar.ShortcutKeyDisplayString})";
+                btnCheckedBackground.ToolTipText = mnuMainCheckBackground.Text + $" ({mnuMainCheckBackground.ShortcutKeyDisplayString})";
+                btnConvert.ToolTipText = mnuMainSaveAs.Text + $" ({mnuMainSaveAs.ShortcutKeyDisplayString})";
+                btnPrintImage.ToolTipText = mnuMainPrint.Text + $" ({mnuMainPrint.ShortcutKeyDisplayString})";
+                btnMenu.ToolTipText = lang[$"{Name}.{nameof(btnMenu)}"];
+
+
+                #endregion
+
                 #endregion
 
                 //Update language layout ------------------
-                RightToLeft = GlobalSetting.LangPack.IsRightToLeftLayout;
+                RightToLeft = Configs.Language.IsRightToLeftLayout;
             }
             #endregion
-
 
             #region THUMBNAIL_BAR or THUMBNAIL_ITEMS
-            if ((flags & MainFormForceUpdateAction.THUMBNAIL_BAR) == MainFormForceUpdateAction.THUMBNAIL_BAR || (flags & MainFormForceUpdateAction.THUMBNAIL_ITEMS) == MainFormForceUpdateAction.THUMBNAIL_ITEMS)
-            {
-                //Update thumbnail bar position
-                GlobalSetting.IsShowThumbnail = !GlobalSetting.IsShowThumbnail;
+            if ((flags & ForceUpdateActions.THUMBNAIL_BAR) == ForceUpdateActions.THUMBNAIL_BAR || (flags & ForceUpdateActions.THUMBNAIL_ITEMS) == ForceUpdateActions.THUMBNAIL_ITEMS) {
+                // Update thumbnail bar position
+                Configs.IsShowThumbnail = !Configs.IsShowThumbnail;
                 mnuMainThumbnailBar_Click(null, null);
 
-                //Update thumbnail bar scroll bar visibility
-                thumbnailBar.ScrollBars = GlobalSetting.IsShowThumbnailScrollbar;
+                // Update thumbnail bar scroll bar visibility
+                thumbnailBar.ScrollBars = Configs.IsShowThumbnailScrollbar;
             }
             #endregion
 
-
             #region THUMBNAIL_ITEMS
-            if ((flags & MainFormForceUpdateAction.THUMBNAIL_ITEMS) == MainFormForceUpdateAction.THUMBNAIL_ITEMS)
-            {
+            if ((flags & ForceUpdateActions.THUMBNAIL_ITEMS) == ForceUpdateActions.THUMBNAIL_ITEMS) {
                 //Update thumbnail image size
                 LoadThumbnails();
             }
             #endregion
 
-
             #region COLOR_PICKER_MENU
-            if ((flags & MainFormForceUpdateAction.COLOR_PICKER_MENU) == MainFormForceUpdateAction.COLOR_PICKER_MENU)
-            {
-                mnuMainColorPicker.Checked = LocalSetting.IsColorPickerToolOpening;
+            if ((flags & ForceUpdateActions.COLOR_PICKER_MENU) == ForceUpdateActions.COLOR_PICKER_MENU) {
+                btnColorPicker.Checked =
+                    mnuMainColorPicker.Checked =
+                    Local.IsColorPickerToolOpening;
             }
             #endregion
 
+            #region PAGE_NAV_MENU
+            if ((flags & ForceUpdateActions.PAGE_NAV_MENU) == ForceUpdateActions.PAGE_NAV_MENU) {
+                mnuMainPageNav.Checked = Local.IsPageNavToolOpenning;
+            }
+            #endregion
 
             #region THEME
-            if ((flags & MainFormForceUpdateAction.THEME) == MainFormForceUpdateAction.THEME)
-            {
-                ApplyTheme(LocalSetting.Theme.ThemeFolderName);
-                LocalSetting.FColorPicker.UpdateUI();
+            if ((flags & ForceUpdateActions.THEME) == ForceUpdateActions.THEME) {
+                ApplyTheme(changeBackground: true);
+                Local.FColorPicker.UpdateUI();
+                Local.FPageNav.UpdateUI();
+                Local.FCrop.UpdateUI();
             }
             #endregion
 
+            #region TOOLBAR
+            if ((flags & ForceUpdateActions.TOOLBAR) == ForceUpdateActions.TOOLBAR) {
+                UpdateToolbarButtons();
+                toolMain.Items.Add(btnMenu);
+                toolMain.Items.Add(lblInfo);
+
+                toolMain.UpdateAlignment();
+            }
+            #endregion
+
+            #region TOOLBAR_POSITION
+            if ((flags & ForceUpdateActions.TOOLBAR_POSITION) == ForceUpdateActions.TOOLBAR_POSITION) {
+                if (Configs.ToolbarPosition == ToolbarPosition.Top) {
+                    toolMain.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+                    toolMain.Dock = DockStyle.Top;
+                    toolMain.ToolTipShowUp = false;
+                }
+                else if (Configs.ToolbarPosition == ToolbarPosition.Bottom) {
+                    toolMain.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+                    toolMain.Dock = DockStyle.Bottom;
+                    toolMain.ToolTipShowUp = true;
+                }
+
+                // update toolbar items alignment
+                toolMain.Alignment = Configs.IsCenterToolbar ? ToolbarAlignment.CENTER : ToolbarAlignment.LEFT;
+
+                // Hide toolbar tooltips
+                toolMain.HideTooltips = Configs.IsHideTooltips;
+            }
+            #endregion
+
+            #region TOOLBAR_ICON_HEIGHT
+            if ((flags & ForceUpdateActions.TOOLBAR_ICON_HEIGHT) == ForceUpdateActions.TOOLBAR_ICON_HEIGHT) {
+                // Update size of toolbar
+                DPIScaling.TransformToolbar(ref toolMain, (int)Configs.ToolbarIconHeight);
+
+                // Update toolbar icon according to the new size
+                LoadToolbarIcons(forceReloadIcon: true);
+
+                toolMain.UpdateAlignment();
+            }
+            #endregion
+
+            #region IMAGE_LIST
+            if ((flags & ForceUpdateActions.IMAGE_LIST) == ForceUpdateActions.IMAGE_LIST) {
+                // update image loading order value
+                LoadLoadingOrderMenuItems();
+
+                // update image list
+                MnuMainReloadImageList_Click(null, null);
+            }
+            #endregion
+
+            #region IMAGE_LIST_NO_RECURSIVE
+            if ((flags & ForceUpdateActions.IMAGE_LIST_NO_RECURSIVE) == ForceUpdateActions.IMAGE_LIST_NO_RECURSIVE) {
+                // update image list with the initial input path
+                _ = PrepareLoadingAsync(new string[] { Local.InitialInputPath }, Local.ImageList.GetFileName(Local.CurrentIndex));
+            }
+            #endregion
 
             #region OTHER_SETTINGS
-            if ((flags & MainFormForceUpdateAction.OTHER_SETTINGS) == MainFormForceUpdateAction.OTHER_SETTINGS)
-            {
+            if ((flags & ForceUpdateActions.OTHER_SETTINGS) == ForceUpdateActions.OTHER_SETTINGS) {
                 #region Update Other Settings
 
-                //Update scrollbars visibility
-                if (GlobalSetting.IsScrollbarsVisible)
-                {
+                // Update scrollbars visibility
+                if (Configs.IsScrollbarsVisible) {
                     picMain.HorizontalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
                     picMain.VerticalScrollBarStyle = ImageBoxScrollBarStyle.Auto;
                 }
-                else
-                {
+                else {
                     picMain.HorizontalScrollBarStyle = ImageBoxScrollBarStyle.Hide;
                     picMain.VerticalScrollBarStyle = ImageBoxScrollBarStyle.Hide;
                 }
 
                 // update checkerboard display mode
-                if (GlobalSetting.IsShowCheckerBoard)
-                {
-                    GlobalSetting.IsShowCheckerBoard = false;
+                if (Configs.IsShowCheckerBoard) {
+                    Configs.IsShowCheckerBoard = false;
                     mnuMainCheckBackground_Click(null, null);
                 }
 
-                //Update background---------------------
-                picMain.BackColor = GlobalSetting.BackgroundColor;
+                // update navigation regions
+                if (Configs.IsShowNavigationButtons) {
+                    Local.NavRegions = GetNavigationRegions();
+                }
 
-                //Update slideshow interval value of timer
-                timSlideShow.Interval = GlobalSetting.SlideShowInterval * 1000;
+                // Update background
+                picMain.BackColor = Configs.BackgroundColor;
+
+                // Update ZoomLevels
+                picMain.ZoomLevels = new ImageBoxZoomLevelCollection(Configs.ZoomLevels);
+
+                ApplyZoomMode(Configs.ZoomMode);
 
                 #endregion
 
             }
             #endregion
 
-
-            #region TOOLBAR
-            if ((flags & MainFormForceUpdateAction.TOOLBAR) == MainFormForceUpdateAction.TOOLBAR)
-            {
-                frmSetting.UpdateToolbarButtons(toolMain, this);
-                toolMain.Items.Add(btnMenu);
-                toolMain.Items.Add(lblInfo);
-            }
-            #endregion
-
-
-            #region TOOLBAR_POSITION
-            if ((flags & MainFormForceUpdateAction.TOOLBAR_POSITION) == MainFormForceUpdateAction.TOOLBAR_POSITION)
-            {
-                if (GlobalSetting.ToolbarPosition == ToolbarPosition.Top)
-                {
-                    toolMain.Anchor = AnchorStyles.Top | AnchorStyles.Left;
-                    toolMain.Dock = DockStyle.Top;
-                }
-                else if (GlobalSetting.ToolbarPosition == ToolbarPosition.Bottom)
-                {
-                    toolMain.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-                    toolMain.Dock = DockStyle.Bottom;
-                }
-
-
-                // For centered toolbar buttons
-                UpdateToolbarButtonsAlignment();
-            }
-            #endregion
-
-
-            #region IMAGE_FOLDER and IMAGE_LIST
-
-            #region IMAGE_FOLDER
-            if ((flags & MainFormForceUpdateAction.IMAGE_FOLDER) == MainFormForceUpdateAction.IMAGE_FOLDER)
-            {
-                Prepare(LocalSetting.InitialInputImageFilename,
-                        GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex));
-            }
-            #endregion
-
-            #region IMAGE_LIST
-            else
-            {
-                if ((flags & MainFormForceUpdateAction.IMAGE_LIST) == MainFormForceUpdateAction.IMAGE_LIST)
-                {
-                    //reload image list
-                    // KBR 20180903 Fix observed issue: rebuild the list using the initial file, not the current,
-                    // but keep the currently visible file in mind!
-                    Prepare(LocalSetting.InitialInputImageFilename,
-                            GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex));
-                }
-            }
-            #endregion
-
-            #endregion
-
-
             #region Windows 10 Specific Actions
-            bool isWin81OrLater = true;
+            var isWin81OrLater = true;
             var winVersion = Environment.OSVersion;
 
             // Win7 == 6.1, Win Server 2008 == 6.1
             // Win10 == 10.0 [if app.manifest properly configured]
             if (winVersion.Version.Major < 6 ||
-                winVersion.Version.Major == 6 && 
-                winVersion.Version.Minor < 2)
-            {
+                (winVersion.Version.Major == 6 &&
+                winVersion.Version.Minor < 2)) {
                 isWin81OrLater = false; // Not running Windows 8 or earlier
             }
-                
 
             mnuMainSetAsLockImage.Enabled = isWin81OrLater;
             #endregion
 
-
-            LocalSetting.ForceUpdateActions = MainFormForceUpdateAction.NONE;
+            Local.ForceUpdateActions = ForceUpdateActions.NONE;
         }
 
-        private void frmMain_ResizeBegin(object sender, EventArgs e)
-        {
+
+        private void frmMain_Resize(object sender, EventArgs e) {
+            if (WindowState != _windowState) {
+                _windowState = WindowState;
+                if (WindowState == FormWindowState.Normal) {
+                    // Restored
+
+                    // Update toolbar icon according to the new size
+                    LoadToolbarIcons(forceReloadIcon: true);
+
+                    toolMain.UpdateAlignment();
+                }
+            }
+        }
+
+        private void frmMain_ResizeBegin(object sender, EventArgs e) {
             _windowSize = Size;
         }
 
-        private void frmMain_ResizeEnd(object sender, EventArgs e)
-        {
-            if (Size != _windowSize)
-            {
-                SaveConfig();
+        private void frmMain_ResizeEnd(object sender, EventArgs e) {
+            if (Size != _windowSize) {
+                SaveConfig(windowStateOnly: true);
             }
         }
 
-        private void frmMain_SizeChanged(object sender, EventArgs e)
-        {
-            if (!_isManuallyZoomed)
-            {
-                ApplyZoomMode(GlobalSetting.ZoomMode);
+        private void frmMain_SizeChanged(object sender, EventArgs e) {
+            if (!_isManuallyZoomed) {
+                ApplyZoomMode(Configs.ZoomMode);
             }
-
-            UpdateToolbarButtonsAlignment();
         }
 
-        private void thumbnailBar_ItemClick(object sender, ImageListView.ItemClickEventArgs e)
-        {
-            GlobalSetting.CurrentIndex = e.Item.Index;
-            NextPic(0);
+        private void thumbnailBar_ItemClick(object sender, ImageListView.ItemClickEventArgs e) {
+            if (e.Buttons == MouseButtons.Left) {
+                Local.CurrentIndex = e.Item.Index;
+                _ = NextPicAsync(0);
+            }
         }
 
-        private void timSlideShow_Tick(object sender, EventArgs e)
-        {
-            // KBR 20190302 perform this check first: if user hits 'End' during slideshow,
-            // the slideshow would start over at beginning, even if IsLoopBackSlideShow was false
-            //stop playing slideshow at last image
-            if (GlobalSetting.CurrentIndex == GlobalSetting.ImageList.Length - 1)
-            {
-                if (!GlobalSetting.IsLoopBackSlideShow)
-                {
-                    mnuMainSlideShowPause_Click(null, null);
-                    return;
+        private void timSlideShow_Tick(object sender, EventArgs e) {
+            if (_slideshowCountdown > 1) {
+                _slideshowCountdown--;
+            }
+            else {
+                // end of image list
+                if (Local.CurrentIndex == Local.ImageList.Length - 1) {
+                    // loop the list
+                    if (!Configs.IsLoopBackSlideshow) {
+                        mnuMainSlideShowPause_Click(null, null);
+                        return;
+                    }
                 }
+
+                _ = NextPicAsync(1);
             }
 
-            NextPic(1);
-
+            // update the countdown text
+            picMain.Invalidate();
         }
 
+        private void PicMain_Paint(object sender, PaintEventArgs e) {
+            // draw slideshow clock
+            PaintSlideshowClock(e);
 
-
+            // draw navigation regions
+            PaintNavigationRegions(e);
+        }
 
         #region File System Watcher events
 
-        private void FileWatcher_OnRenamed(object sender, FileChangedEvent e)
-        {
-            if (this.InvokeRequired)
-            {
+        private void FileWatcher_OnRenamed(object sender, FileChangedEvent e) {
+            if (this.InvokeRequired) {
                 this.Invoke(new Action<object, FileChangedEvent>(FileWatcher_OnRenamed), sender, e);
                 return;
             }
 
-            string newFilename = e.FullPath;
-            string oldFilename = e.OldFullPath;
-
+            var newFilename = e.FullPath;
+            var oldFilename = e.OldFullPath;
 
             var oldExt = Path.GetExtension(oldFilename).ToLower();
             var newExt = Path.GetExtension(newFilename).ToLower();
 
             // Only watch the supported file types
-            if (!GlobalSetting.ImageFormatHashSet.Contains(oldExt) && !GlobalSetting.ImageFormatHashSet.Contains(newExt))
-            {
+            if (!Configs.AllFormats.Contains(oldExt) && !Configs.AllFormats.Contains(newExt)) {
                 return;
             }
 
+            // Get index of renamed image
+            var imgIndex = Local.ImageList.IndexOf(oldFilename);
 
-            //Get index of renamed image
-            int imgIndex = GlobalSetting.ImageList.IndexOf(oldFilename);
-
-
-            //if user changed file extension
-            if (oldExt.CompareTo(newExt) != 0)
-            {
+            // if user changed file extension
+            if (oldExt.CompareTo(newExt) != 0) {
                 // [old] && [new]: update filename only
-                if (GlobalSetting.ImageFormatHashSet.Contains(oldExt) && GlobalSetting.ImageFormatHashSet.Contains(newExt))
-                {
-                    if (imgIndex > -1)
-                    {
+                if (Configs.AllFormats.Contains(oldExt) && Configs.AllFormats.Contains(newExt)) {
+                    if (imgIndex > -1) {
                         RenameAction();
                     }
                 }
-                else
-                {
+                else {
                     // [old] && ![new]: remove from image list
-                    if (GlobalSetting.ImageFormatHashSet.Contains(oldExt))
-                    {
+                    if (Configs.AllFormats.Contains(oldExt)) {
                         DoDeleteFiles(oldFilename);
                     }
                     // ![old] && [new]: add to image list
-                    else if (GlobalSetting.ImageFormatHashSet.Contains(newExt))
-                    {
+                    else if (Configs.AllFormats.Contains(newExt)) {
                         FileWatcher_AddNewFileAction(newFilename);
                     }
                 }
             }
             //if user changed filename only (not extension)
-            else
-            {
-                if (imgIndex > -1)
-                {
+            else {
+                if (imgIndex > -1) {
                     RenameAction();
                 }
             }
 
-
-            void RenameAction()
-            {
+            void RenameAction() {
                 //Rename file in image list
-                GlobalSetting.ImageList.SetFileName(imgIndex, newFilename);
+                Local.ImageList.SetFileName(imgIndex, newFilename);
 
                 //Update status bar title
-                UpdateStatusBar();
+                SetStatusBar();
 
-                try
-                {
+                try {
                     //Rename image in thumbnail bar
                     thumbnailBar.Items[imgIndex].Text = Path.GetFileName(e.FullPath);
                     thumbnailBar.Items[imgIndex].Tag = newFilename;
@@ -3129,69 +3564,55 @@ namespace ImageGlass
                 catch { }
 
                 // User renamed the initial file - update in case of list reload
-                if (oldFilename == LocalSetting.InitialInputImageFilename)
-                    LocalSetting.InitialInputImageFilename = newFilename;
+                if (oldFilename == Local.InitialInputPath)
+                    Local.InitialInputPath = newFilename;
             }
-
-
         }
 
-
-        private void FileWatcher_OnChanged(object sender, FileChangedEvent e)
-        {
+        private void FileWatcher_OnChanged(object sender, FileChangedEvent e) {
             // Only watch the supported file types
             var ext = Path.GetExtension(e.FullPath).ToLower();
-            if (!GlobalSetting.ImageFormatHashSet.Contains(ext))
-            {
+            if (!Configs.AllFormats.Contains(ext)) {
                 return;
             }
-            
+
             // update the viewing image
-            var imgIndex = GlobalSetting.ImageList.IndexOf(e.FullPath);
+            var imgIndex = Local.ImageList.IndexOf(e.FullPath);
 
             // KBR 20180827 When downloading using Chrome, the downloaded file quickly transits
             // from ".tmp" > ".jpg.crdownload" > ".jpg". The last is a "changed" event, and the
             // final ".jpg" cannot exist in the ImageList. Fire this off to the "rename" logic
             // so the new file is correctly added. [Could it be the "created" instead?]
-            if (imgIndex == -1)
-            {
+            if (imgIndex == -1) {
                 this.Invoke(new Action<object, FileChangedEvent>(FileWatcher_OnRenamed), sender, e);
                 return;
             }
 
-            if (imgIndex == GlobalSetting.CurrentIndex)
-            {
-                NextPic(0, true, true);
+            if (imgIndex == Local.CurrentIndex) {
+                _ = NextPicAsync(0, true, true);
             }
 
             //update thumbnail
             thumbnailBar.Items[imgIndex].Update();
         }
-        
 
-        private void FileWatcher_OnCreated(object sender, FileChangedEvent e)
-        {
+        private void FileWatcher_OnCreated(object sender, FileChangedEvent e) {
             // Only watch the supported file types
             var ext = Path.GetExtension(e.FullPath).ToLower();
 
-            if (!GlobalSetting.ImageFormatHashSet.Contains(ext))
-            {
+            if (!Configs.AllFormats.Contains(ext)) {
                 return;
             }
 
-            if (GlobalSetting.ImageList.IndexOf(e.FullPath) == -1)
-            {
+            if (Local.ImageList.IndexOf(e.FullPath) == -1) {
                 FileWatcher_AddNewFileAction(e.FullPath);
             }
         }
-        
 
-        private void FileWatcher_OnDeleted(object sender, FileChangedEvent e)
-        {
+        private void FileWatcher_OnDeleted(object sender, FileChangedEvent e) {
             // Only watch the supported file types
             var ext = Path.GetExtension(e.FullPath).ToLower();
-            if (!GlobalSetting.ImageFormatHashSet.Contains(ext))
-            {
+            if (!Configs.AllFormats.Contains(ext)) {
                 return;
             }
 
@@ -3199,121 +3620,89 @@ namespace ImageGlass
             this._queueListForDeleting.Add(e.FullPath);
         }
 
-
-        private void FileWatcher_AddNewFileAction(string newFilename)
-        {
+        private void FileWatcher_AddNewFileAction(string newFilename) {
             //Add the new image to the list
-            GlobalSetting.ImageList.AddItem(newFilename);
+            Local.ImageList.Add(newFilename);
 
             //Add the new image to thumbnail bar
-            ImageListView.ImageListViewItem lvi = new ImageListView.ImageListViewItem(newFilename)
-            {
+            var lvi = new ImageListView.ImageListViewItem(newFilename) {
                 Tag = newFilename
             };
 
             thumbnailBar.Items.Add(lvi);
             thumbnailBar.Refresh();
 
-            UpdateStatusBar(); // File count has changed - update title bar
+            SetStatusBar(); // File count has changed - update title bar
         }
-        
 
         /// <summary>
         /// The queue thread to check the files needed to be deleted.
         /// </summary>
-        private void ThreadWatcherDeleteFiles()
-        {
-            while (true)
-            {
-                if (_queueListForDeleting.Count > 0)
-                {
+        private void ThreadWatcherDeleteFiles() {
+            while (true) {
+                if (_queueListForDeleting.Count > 0) {
                     var filename = _queueListForDeleting[0];
                     _queueListForDeleting.RemoveAt(0);
 
                     DoDeleteFiles(filename);
                 }
-                else
-                {
+                else {
                     System.Threading.Thread.Sleep(200);
                 }
             }
         }
 
-
         /// <summary>
         /// Proceed deleting file in memory
         /// </summary>
         /// <param name="filename"></param>
-        private void DoDeleteFiles(string filename)
-        {
-            if (this.InvokeRequired)
-            {
+        private void DoDeleteFiles(string filename) {
+            if (this.InvokeRequired) {
                 this.Invoke(new Action<string>(DoDeleteFiles), filename);
                 return;
             }
 
-            //Get index of deleted image
-            int imgIndex = GlobalSetting.ImageList.IndexOf(filename);
+            // Get index of deleted image
+            var imgIndex = Local.ImageList.IndexOf(filename);
 
-            if (imgIndex > -1)
-            {
-                //delete image list
-                GlobalSetting.ImageList.Remove(imgIndex);
+            if (imgIndex > -1) {
+                // delete image list
+                Local.ImageList.Remove(imgIndex);
 
-                //delete thumbnail list
+                // delete thumbnail list
                 thumbnailBar.Items.RemoveAt(imgIndex);
 
                 // change the viewing image to memory data mode
-                if (imgIndex == GlobalSetting.CurrentIndex)
-                {
-                    GlobalSetting.IsImageError = true;
-                    LocalSetting.IsTempMemoryData = true;
+                if (imgIndex == Local.CurrentIndex) {
+                    Local.ImageError = new Exception("File not found.");
+                    Local.IsTempMemoryData = true;
 
-                    DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._ImageNotExist"], 1300);
+                    ShowToastMsg(Configs.Language.Items[$"{Name}._ImageNotExist"], 1300);
 
-                    if (_queueListForDeleting.Count == 0)
-                    {
-                        NextPic(0);
+                    if (_queueListForDeleting.Count == 0) {
+                        _ = NextPicAsync(0);
                     }
                 }
 
                 // If user deletes the initially loaded image, use the path instead, in case
                 // of list re-load.
-                if (filename == LocalSetting.InitialInputImageFilename)
-                    LocalSetting.InitialInputImageFilename = Path.GetDirectoryName(filename);
+                if (filename == Local.InitialInputPath)
+                    Local.InitialInputPath = Path.GetDirectoryName(filename);
             }
         }
 
-
         #endregion
 
-
-
-
-
-
         // Use mouse wheel to navigate, scroll, or zoom images
-        private void picMain_MouseWheel(object sender, MouseEventArgs e)
-        {
-            MouseWheelActions action;
-            switch(Control.ModifierKeys)
-            {
-                case Keys.Control:
-                    action = GlobalSetting.MouseWheelCtrlAction;
-                    break;
-                case Keys.Shift:
-                    action = GlobalSetting.MouseWheelShiftAction;
-                    break;
-                case Keys.Alt:
-                    action = GlobalSetting.MouseWheelAltAction;
-                    break;
-                case Keys.None:
-                default:
-                    action = GlobalSetting.MouseWheelAction;
-                    break;
-            }
-            switch(action)
-            {
+        private void picMain_MouseWheel(object sender, MouseEventArgs e) {
+            var action = Control.ModifierKeys switch {
+                Keys.Control => Configs.MouseWheelCtrlAction,
+                Keys.Shift => Configs.MouseWheelShiftAction,
+                Keys.Alt => Configs.MouseWheelAltAction,
+                _ => Configs.MouseWheelAction,
+            };
+
+            switch (action) {
                 case MouseWheelActions.Zoom:
                     picMain.ZoomWithMouseWheel(e.Delta, e.Location);
                     break;
@@ -3324,14 +3713,12 @@ namespace ImageGlass
                     picMain.ScrollWithMouseWheel(e.Delta, true);
                     break;
                 case MouseWheelActions.BrowseImages:
-                    if (e.Delta < 0)
-                    {
-                        //Next pic
+                    if (e.Delta < 0) {
+                        // Next pic
                         mnuMainViewNext_Click(null, null);
                     }
-                    else
-                    {
-                        //Previous pic
+                    else {
+                        // Previous pic
                         mnuMainViewPrevious_Click(null, null);
                     }
                     break;
@@ -3339,32 +3726,27 @@ namespace ImageGlass
                 default:
                     break;
             }
-            
         }
 
-        private void picMain_Zoomed(object sender, ImageBoxZoomEventArgs e)
-        {
+        private void picMain_Zoomed(object sender, ImageBoxZoomEventArgs e) {
             _isManuallyZoomed = true;
 
             // Set new zoom ratio if Zoom Mode LockZoomRatio is enabled
-            if (GlobalSetting.ZoomMode == ZoomMode.LockZoomRatio)
-            {
-                GlobalSetting.ZoomLockValue = e.NewZoom;
+            if (Configs.ZoomMode == ZoomMode.LockZoomRatio) {
+                Configs.ZoomLockValue = e.NewZoom;
             }
 
             // Zoom optimization
             ZoomOptimization();
 
             // Update zoom info
-            UpdateStatusBar();
+            SetStatusBar();
         }
-        
-        private void picMain_MouseClick(object sender, MouseEventArgs e)
-        {
-            switch (e.Button)
-            {
+
+        private void picMain_MouseClick(object sender, MouseEventArgs e) {
+            switch (e.Button) {
                 case MouseButtons.Middle: //Reset zoom mode
-                    ApplyZoomMode(GlobalSetting.ZoomMode);
+                    ApplyZoomMode(Configs.ZoomMode);
                     break;
 
                 case MouseButtons.XButton1: //Back
@@ -3376,582 +3758,585 @@ namespace ImageGlass
                     break;
 
                 case MouseButtons.Left:
-                    if (GlobalSetting.IsShowNavigationButtons && !picMain.IsPanning)
-                    {
-                        CheckCursorPositionOnViewer(e.Location, onCursorLeftAction: () =>
-                        {
-                            mnuMainViewPrevious_Click(null, null);
-                        }, onCursorRightAction: () =>
-                        {
-                            mnuMainViewNext_Click(null, null);
-                        });
+                    var navRegion = TestCursorHitNavRegions(e.Location);
+
+                    if (navRegion?.Type == NavigationRegionType.Left) {
+                        mnuMainViewPrevious_Click(null, null);
+                    }
+                    else if (navRegion?.Type == NavigationRegionType.Right) {
+                        mnuMainViewNext_Click(null, null);
                     }
                     break;
 
                 default:
                     break;
             }
-
-            
         }
 
-        private void picMain_MouseDoubleClick(object sender, MouseEventArgs e)
-        {
-            void ToggleActualSize()
-            {
-                if (picMain.Zoom < 100)
-                {
-                    mnuMainActualSize_Click(null, null);
-                }
-                else
-                {
-                    ApplyZoomMode(GlobalSetting.ZoomMode);
-                }
-            }
+        private void picMain_MouseDoubleClick(object sender, MouseEventArgs e) {
+            switch (e.Button) {
+                case MouseButtons.XButton1:
+                    mnuMainViewPrevious_Click(null, null);
+                    break;
 
+                case MouseButtons.XButton2:
+                    mnuMainViewNext_Click(null, null);
+                    break;
 
-            if (GlobalSetting.IsShowNavigationButtons)
-            {
-                CheckCursorPositionOnViewer(e.Location, onCursorCenterAction: () =>
-                {
-                    ToggleActualSize();
-                });
-            }
-            else
-            {
-                ToggleActualSize();
-            }
-        }
-
-
-        private void picMain_MouseMove(object sender, MouseEventArgs e)
-        {
-            if (!picMain.IsPanning)
-            {
-                void SetDefaultCursor()
-                {
-                    if (LocalSetting.IsColorPickerToolOpening)
-                    {
-                        picMain.Cursor = Cursors.Cross;
+                case MouseButtons.Left:
+                    // check double-click in Navigation regions
+                    var navRegion = TestCursorHitNavRegions(e.Location);
+                    if (navRegion?.Type == NavigationRegionType.Left) {
+                        _ = NextPicAsync(-1);
                     }
-                    else
-                    {
-                        picMain.Cursor = _isAppBusy ? Cursors.WaitCursor : Cursors.Default;
+                    else if (navRegion?.Type == NavigationRegionType.Right) {
+                        _ = NextPicAsync(1);
                     }
-                }
+                    else {
+                        if (picMain.Zoom < 100) {
+                            mnuMainActualSize_Click(null, null);
+                        }
+                        else {
+                            ApplyZoomMode(Configs.ZoomMode);
+                        }
+                    }
+                    break;
 
-                // set the Arrow cursor
-                if (GlobalSetting.IsShowNavigationButtons)
-                {
-
-                    CheckCursorPositionOnViewer(e.Location, onCursorLeftAction: () =>
-                    {
-                        picMain.Cursor = LocalSetting.Theme.PreviousArrowCursor ?? DefaultCursor;
-
-                    }, onCursorRightAction: () =>
-                    {
-                        picMain.Cursor = LocalSetting.Theme.NextArrowCursor ?? DefaultCursor;
-
-                    }, onCursorCenterAction: () =>
-                    {
-                        SetDefaultCursor();
-                    });
-
-                }
-
-                //reset the cursor
-                else
-                {
-                    SetDefaultCursor();
-                }
+                default:
+                    break;
             }
         }
 
-        private void sp1_SplitterMoved(object sender, SplitterEventArgs e)
-        {
+        private void picMain_MouseMove(object sender, MouseEventArgs e) {
+            #region Navigation regions
+            // get current cursor position on frmMain
+            var pos = this.PointToClient(MousePosition);
+            var navRegion = TestCursorHitNavRegions(pos);
+
+            // get the current nav type
+            var navType = navRegion?.Type ?? NavigationRegionType.Unknown;
+
+            // only draw if nav type is different
+            if (Local.NavRegionType != navType) {
+                Local.NavRegionType = navType;
+
+                // draw navigation regions
+                picMain.Invalidate();
+            }
+            #endregion
+        }
+
+        private void picMain_MouseLeave(object sender, EventArgs e) {
+            if (Local.NavRegionType != NavigationRegionType.Unknown) {
+                Local.NavRegionType = NavigationRegionType.Unknown;
+
+                // draw navigation regions
+                picMain.Invalidate();
+            }
+        }
+
+        private void picMain_SizeChanged(object sender, EventArgs e) {
+            // update navigation regions list
+            if (Configs.IsShowNavigationButtons) {
+                Local.NavRegions = GetNavigationRegions();
+            }
+        }
+
+        private void sp1_SplitterMoved(object sender, SplitterEventArgs e) {
             // User has moved the thumbnail splitter bar. Update image size.
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            if (!_isManuallyZoomed) {
+                ApplyZoomMode(Configs.ZoomMode);
+            }
         }
-
 
         #endregion
 
-
-
         #region Toolbar Buttons Events
 
-        private void btnNext_Click(object sender, EventArgs e)
-        {
+        private void btnNext_Click(object sender, EventArgs e) {
             mnuMainViewNext_Click(null, e);
         }
 
-        private void btnBack_Click(object sender, EventArgs e)
-        {
+        private void btnBack_Click(object sender, EventArgs e) {
             mnuMainViewPrevious_Click(null, e);
         }
 
-        private void btnRefresh_Click(object sender, EventArgs e)
-        {
+        private void btnRefresh_Click(object sender, EventArgs e) {
             mnuMainRefresh_Click(null, null);
         }
 
-        private void btnRotateRight_Click(object sender, EventArgs e)
-        {
+        private void btnRotateRight_Click(object sender, EventArgs e) {
             mnuMainRotateClockwise_Click(null, e);
         }
 
-        private void btnRotateLeft_Click(object sender, EventArgs e)
-        {
+        private void btnRotateLeft_Click(object sender, EventArgs e) {
             mnuMainRotateCounterclockwise_Click(null, e);
         }
 
-        private void btnFlipHorz_Click(object sender, EventArgs e)
-        {
+        private void btnFlipHorz_Click(object sender, EventArgs e) {
             mnuMainFlipHorz_Click(null, null);
         }
 
-        private void btnFlipVert_Click(object sender, EventArgs e)
-        {
+        private void btnFlipVert_Click(object sender, EventArgs e) {
             mnuMainFlipVert_Click(null, null);
         }
 
-        private void btnDelete_Click(object sender, EventArgs e)
-        {
+        private void btnDelete_Click(object sender, EventArgs e) {
             mnuMainMoveToRecycleBin_Click(null, e);
         }
 
-        private void btnOpen_Click(object sender, EventArgs e)
-        {
+        private void btnEdit_Click(object sender, EventArgs e) {
+            mnuMainEditImage_Click(null, null);
+        }
+
+        private void btnCropping_Click(object sender, EventArgs e) {
+            mnuMainCrop.PerformClick();
+        }
+
+        private void btnColorPicker_Click(object sender, EventArgs e) {
+            mnuMainColorPicker.PerformClick();
+        }
+
+        private void btnOpen_Click(object sender, EventArgs e) {
             mnuMainOpenFile_Click(null, e);
         }
 
-        private void btnThumb_Click(object sender, EventArgs e)
-        {
+        private void btnThumb_Click(object sender, EventArgs e) {
             mnuMainThumbnailBar_Click(null, e);
         }
 
-        private void btnActualSize_Click(object sender, EventArgs e)
-        {
+        private void btnActualSize_Click(object sender, EventArgs e) {
             mnuMainActualSize_Click(null, e);
         }
 
-        private void btnAutoZoom_Click(object sender, EventArgs e)
-        {
+        private void btnAutoZoom_Click(object sender, EventArgs e) {
             mnuMainAutoZoom_Click(null, e);
         }
 
-        private void btnScaletoWidth_Click(object sender, EventArgs e)
-        {
+        private void btnScaletoWidth_Click(object sender, EventArgs e) {
             mnuMainScaleToWidth_Click(null, e);
         }
 
-        private void btnScaletoHeight_Click(object sender, EventArgs e)
-        {
+        private void btnScaletoHeight_Click(object sender, EventArgs e) {
             mnuMainScaleToHeight_Click(null, e);
         }
 
-        private void btnWindowAutosize_Click(object sender, EventArgs e)
-        {
-            mnuMainWindowAdaptImage_Click(null, e);
+        private void btnWindowFit_Click(object sender, EventArgs e) {
+            mnuWindowFit_Click(null, e);
         }
 
-        private void btnGoto_Click(object sender, EventArgs e)
-        {
+        private void btnGoto_Click(object sender, EventArgs e) {
             mnuMainGoto_Click(null, e);
         }
 
-        private void btnCheckedBackground_Click(object sender, EventArgs e)
-        {
+        private void btnCheckedBackground_Click(object sender, EventArgs e) {
             mnuMainCheckBackground_Click(null, e);
         }
 
-        private void btnZoomIn_Click(object sender, EventArgs e)
-        {
+        private void btnZoomIn_Click(object sender, EventArgs e) {
             mnuMainZoomIn_Click(null, e);
         }
 
-        private void btnZoomOut_Click(object sender, EventArgs e)
-        {
+        private void btnZoomOut_Click(object sender, EventArgs e) {
             mnuMainZoomOut_Click(null, e);
         }
 
-        private void btnScaleToFit_Click(object sender, EventArgs e)
-        {
+        private void btnScaleToFit_Click(object sender, EventArgs e) {
             mnuMainScaleToFit_Click(null, e);
         }
 
-        private void btnZoomLock_Click(object sender, EventArgs e)
-        {
+        private void btnScaleToFill_Click(object sender, EventArgs e) {
+            mnuMainScaleToFill_Click(null, e);
+        }
+
+        private void btnZoomLock_Click(object sender, EventArgs e) {
             mnuMainLockZoomRatio_Click(null, e);
         }
 
-        private void btnSlideShow_Click(object sender, EventArgs e)
-        {
+        private void btnSlideShow_Click(object sender, EventArgs e) {
             mnuMainSlideShowStart_Click(null, null);
         }
 
-        private void btnFullScreen_Click(object sender, EventArgs e)
-        {
+        private void btnFullScreen_Click(object sender, EventArgs e) {
             mnuMainFullScreen_Click(null, e);
         }
 
-        private void btnPrintImage_Click(object sender, EventArgs e)
-        {
+        private void btnPrintImage_Click(object sender, EventArgs e) {
             mnuMainPrint_Click(null, e);
         }
 
-        private void btnConvert_Click(object sender, EventArgs e)
-        {
+        private void btnConvert_Click(object sender, EventArgs e) {
             mnuMainSaveAs_Click(null, e);
         }
 
-        private void btnMenu_Click(object sender, EventArgs e)
-        {
+        private void btnMenu_Click(object sender, EventArgs e) {
             mnuMain.Show(toolMain, toolMain.Width - mnuMain.Width, toolMain.Height);
         }
         #endregion
 
-
-
         #region Context Menu
-        private void mnuContext_Opening(object sender, CancelEventArgs e)
-        {
-            bool isImageError = false;
+        private void OpenShortcutMenu(ToolStripMenuItem parentMenu) {
+            mnuShortcut.Items.Clear();
 
-            try
-            {
-                if (!File.Exists(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)) || GlobalSetting.IsImageError)
-                {
-                    isImageError = true;
-                }
+            foreach (ToolStripRadioButtonMenuItem item in parentMenu.DropDownItems) {
+                mnuShortcut.Items.Add(UI.Menu.Clone(item));
             }
-            catch { e.Cancel = true; return; }
 
-            //clear current items
+            mnuShortcut.Show(Cursor.Position);
+        }
+
+
+        private async void mnuContext_Opening(object sender, CancelEventArgs e) {
+            var imageNotFound = !File.Exists(Local.ImageList.GetFileName(Local.CurrentIndex));
+            var imageError = Local.ImageError != null;
+
+            // clear current items
             mnuContext.Items.Clear();
 
-            if (GlobalSetting.IsPlaySlideShow && !isImageError)
-            {
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainSlideShowPause));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainSlideShowExit));
+            if (Configs.IsSlideshow && !imageNotFound) {
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainSlideShowPause));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainSlideShowExit));
                 mnuContext.Items.Add(new ToolStripSeparator());//---------------
             }
 
-            //toolbar menu
-            mnuContext.Items.Add(Library.Menu.Clone(mnuMainToolbar));
-            mnuContext.Items.Add(Library.Menu.Clone(mnuMainAlwaysOnTop));
-            
+            // toolbar menu
+            mnuContext.Items.Add(UI.Menu.Clone(mnuMainToolbar));
+            mnuContext.Items.Add(UI.Menu.Clone(mnuMainAlwaysOnTop));
 
-            //Get Editing Assoc App info
-            if (!isImageError)
-            {
+            mnuContext.Items.Add(new ToolStripSeparator());//---------------
+            mnuContext.Items.Add(UI.Menu.Clone(mnuLoadingOrder));
+
+            // Get Edit App info
+            if (!imageNotFound) {
+                if (!imageError && !Local.IsTempMemoryData) {
+                    mnuContext.Items.Add(UI.Menu.Clone(mnuMainChannels));
+                }
+
                 mnuContext.Items.Add(new ToolStripSeparator());//---------------
+                mnuContext.Items.Add(UI.Menu.Clone(mnuOpenWith));
 
-                UpdateEditingAssocAppInfoForMenu();
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainEditImage));
+                UpdateEditAppInfoForMenu();
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainEditImage));
 
-                //check if image can animate (GIF)
-                try
-                {
-                    Image img = GlobalSetting.ImageList.GetImage(GlobalSetting.CurrentIndex);
-                    FrameDimension dim = new FrameDimension(img.FrameDimensionsList[0]);
-                    int frameCount = img.GetFrameCount(dim);
+                #region Check if image can animate (GIF)
+                try {
+                    var imgData = await Local.ImageList.GetImgAsync(Local.CurrentIndex).ConfigureAwait(true);
 
-                    if (frameCount > 1)
-                    {
-                        var mi = Library.Menu.Clone(mnuMainExtractFrames);
-                        mi.Text = string.Format(GlobalSetting.LangPack.Items["frmMain.mnuMainExtractFrames"], frameCount);
-                        mi.Enabled = true;
+                    if (!imageError && imgData.PageCount > 1) {
+                        var mnu1 = UI.Menu.Clone(mnuMainExtractPages);
+                        mnu1.Text = string.Format(Configs.Language.Items[$"{Name}.mnuMainExtractPages"], imgData.PageCount);
+                        mnu1.Enabled = true;
 
-                        mnuContext.Items.Add(mi);
-                        var mi2 = Library.Menu.Clone(mnuMainStartStopAnimating);
-                        mi2.Enabled = true;
-                        mnuContext.Items.Add(mi2);
+                        var mnu2 = UI.Menu.Clone(mnuMainStartStopAnimating);
+                        mnu2.Enabled = true;
+
+                        mnuContext.Items.Add(mnu1);
+                        mnuContext.Items.Add(mnu2);
                     }
-
                 }
                 catch { }
+                #endregion
             }
 
-
-            if (LocalSetting.IsTempMemoryData || !isImageError)
-            {
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainSetAsDesktop));
+            if (!imageNotFound && !imageError || Local.IsTempMemoryData) {
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainSetAsDesktop));
 
                 // check if igcmdWin10.exe exists!
-                if (File.Exists(GlobalSetting.StartUpDir("igcmdWin10.exe")))
-                {
-                    mnuContext.Items.Add(Library.Menu.Clone(mnuMainSetAsLockImage));
-                }                
+                if (_isWindows10 && File.Exists(App.StartUpDir("igcmdWin10.exe"))) {
+                    mnuContext.Items.Add(UI.Menu.Clone(mnuMainSetAsLockImage));
+                }
             }
-
 
             #region Menu group: CLIPBOARD
             mnuContext.Items.Add(new ToolStripSeparator());//------------
-            mnuContext.Items.Add(Library.Menu.Clone(mnuMainOpenImageData));
 
-            if (!isImageError && !LocalSetting.IsTempMemoryData)
-            {
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainClearClipboard));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainCopy));
+            if (picMain.Image != null) {
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainCopyImageData));
             }
 
-            if (picMain.Image != null)
-            {
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainCopyImageData));
+            if (!imageNotFound && !Local.IsTempMemoryData) {
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainCopy));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainCut));
             }
 
-            if (!isImageError && !LocalSetting.IsTempMemoryData)
-            {
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainCut));
+            mnuContext.Items.Add(UI.Menu.Clone(mnuMainOpenImageData));
+            if (!imageNotFound && !Local.IsTempMemoryData) {
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainClearClipboard));
             }
             #endregion
 
-
-            if (!isImageError && !LocalSetting.IsTempMemoryData)
-            {
+            if (!imageNotFound && !Local.IsTempMemoryData) {
                 mnuContext.Items.Add(new ToolStripSeparator());//------------
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainRename));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainMoveToRecycleBin));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainDeleteFromHardDisk));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainRename));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainMoveToRecycleBin));
 
                 mnuContext.Items.Add(new ToolStripSeparator());//------------
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainCopyImagePath));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainImageLocation));
-                mnuContext.Items.Add(Library.Menu.Clone(mnuMainImageProperties));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainCopyImagePath));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainImageLocation));
+                mnuContext.Items.Add(UI.Menu.Clone(mnuMainImageProperties));
             }
-            
         }
         #endregion
 
-
-
         #region Main Menu (Main functions)
 
-        private void mnuMainOpenFile_Click(object sender, EventArgs e)
-        {
+        private void mnuMainOpenFile_Click(object sender, EventArgs e) {
             OpenFile();
         }
 
-        private void mnuMainOpenImageData_Click(object sender, EventArgs e)
-        {
-            //Is there a file in clipboard ?--------------------------------------------------
-            if (Clipboard.ContainsFileDropList())
-            {
-                string[] sFile = (string[])Clipboard.GetData(DataFormats.FileDrop);
-                int fileCount = 0;
+        private void MnuMainNewWindow_Click(object sender, EventArgs e) {
+            if (!Configs.IsAllowMultiInstances) {
+                ShowToastMsg(Configs.Language.Items[$"{Name}.mnuMainNewWindow._Error"], 2000);
 
-                fileCount = sFile.Length;
-
-                // load file
-                Prepare(sFile[0]);
+                return;
             }
 
+            try {
+                var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
 
-            //Is there a image in clipboard ?-------------------------------------------------
-            //CheckImageInClipboard: ;
-            else if (Clipboard.ContainsImage())
-            {
+                Process.Start(new ProcessStartInfo() {
+                    FileName = Application.ExecutablePath,
+                    Arguments = $"\"{filename}\"",
+                });
+            }
+            catch { }
+        }
+
+        private void mnuMainOpenImageData_Click(object sender, EventArgs e) {
+            picMain.Text = string.Empty;
+
+            // Is there a file in clipboard ?
+            if (Clipboard.ContainsFileDropList()) {
+                var sFile = (string[])Clipboard.GetData(DataFormats.FileDrop);
+
+                // load file
+                PrepareLoading(sFile[0]);
+            }
+
+            // Is there a image in clipboard ?
+            // CheckImageInClipboard: ;
+            else if (Clipboard.ContainsImage()) {
                 LoadImageData(Clipboard.GetImage());
             }
 
-            //Is there a filename in clipboard?-----------------------------------------------
-            //CheckPathInClipboard: ;
-            else if (Clipboard.ContainsText())
-            {
-                if (File.Exists(Clipboard.GetText()) || Directory.Exists(Clipboard.GetText()))
-                {
-                    Prepare(Clipboard.GetText());
-                }
-                //get image from Base64string 
-                else
-                {
-                    try
-                    {
-                        // data:image/jpeg;base64,xxxxxxxx
-                        string base64str = Clipboard.GetText().Substring(Clipboard.GetText().LastIndexOf(',') + 1);
-                        var file_bytes = Convert.FromBase64String(base64str);
-                        var file_stream = new MemoryStream(file_bytes);
-                        var file_image = Image.FromStream(file_stream);
+            // Is there a filename in clipboard?
+            // CheckPathInClipboard: ;
+            else if (Clipboard.ContainsText()) {
+                // try to get absolute path
+                var text = App.ToAbsolutePath(Clipboard.GetText());
 
-                        picMain.Image = file_image;
-                        LocalSetting.IsTempMemoryData = true;
+                if (File.Exists(text) || Directory.Exists(text)) {
+                    PrepareLoading(text);
+                }
+                // get image from Base64string 
+                else {
+                    try {
+                        picMain.Image = Heart.Photo.ConvertBase64ToBitmap(text);
+                        Local.IsTempMemoryData = true;
+
+                        SetStatusBar();
                     }
-                    catch { }
+                    catch (Exception ex) {
+                        var msg = Configs.Language.Items[$"{Name}._InvalidImageClipboardData"];
+                        ShowToastMsg($"{msg}\r\n{ex.Source}: {ex.Message}", 3000);
+                    }
                 }
             }
         }
 
-        private async void mnuMainSaveAs_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+        private async void mnuMainSaveAs_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) {
                 return;
             }
 
-            string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-            if (filename == "")
-            {
+            var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
+            if (string.IsNullOrEmpty(filename)) {
                 filename = "untitled.png";
             }
-            string ext = Path.GetExtension(filename).Substring(1);
 
+            var ext = Path.GetExtension(filename).Substring(1);
 
-            SaveFileDialog s = new SaveFileDialog
-            {
-                Filter = "BMP|*.bmp|EMF|*.emf|EXIF|*.exif|GIF|*.gif|ICO|*.ico|JPG|*.jpg|PNG|*.png|TIFF|*.tiff|WMF|*.wmf|Base64String (*.txt)|*.txt",
+            var saveDialog = new SaveFileDialog {
+                Filter = "BMP|*.bmp|EMF|*.emf|EXIF|*.exif|GIF|*.gif|ICO|*.ico|JPG|*.jpg|PNG|*.png|JPEG-XL|*.jxl|TIFF|*.tiff|WMF|*.wmf|Base64String (*.b64)|*.b64|Base64String (*.txt)|*.txt",
                 FileName = Path.GetFileNameWithoutExtension(filename)
             };
 
-            switch (ext.ToLower())
-            {
-                case "bmp":
-                    s.FilterIndex = 1;
-                    break;
-                case "emf":
-                    s.FilterIndex = 2;
-                    break;
-                case "exif":
-                    s.FilterIndex = 3;
-                    break;
-                case "gif":
-                    s.FilterIndex = 4;
-                    break;
-                case "ico":
-                    s.FilterIndex = 5;
-                    break;
-                case "jpg":
-                    s.FilterIndex = 6;
-                    break;
-                case "png":
-                    s.FilterIndex = 7;
-                    break;
-                case "tiff":
-                    s.FilterIndex = 8;
-                    break;
-                case "wmf":
-                    s.FilterIndex = 9;
-                    break;
+            // Use the last-selected file extension, if available.
+            if (Local.SaveAsFilterIndex != 0) {
+                saveDialog.FilterIndex = Local.SaveAsFilterIndex;
+            }
+            else {
+                switch (ext.ToLower()) {
+                    case "bmp":
+                        saveDialog.FilterIndex = 1;
+                        break;
+                    case "emf":
+                        saveDialog.FilterIndex = 2;
+                        break;
+                    case "exif":
+                        saveDialog.FilterIndex = 3;
+                        break;
+                    case "gif":
+                        saveDialog.FilterIndex = 4;
+                        break;
+                    case "ico":
+                        saveDialog.FilterIndex = 5;
+                        break;
+                    case "jpg":
+                    case "jpeg":
+                    case "jpe":
+                        saveDialog.FilterIndex = 6;
+                        break;
+                    case "png":
+                        saveDialog.FilterIndex = 7;
+                        break;
+                    case "jxl":
+                        saveDialog.FilterIndex = 8;
+                        break;
+                    case "tiff":
+                        saveDialog.FilterIndex = 9;
+                        break;
+                    case "wmf":
+                        saveDialog.FilterIndex = 10;
+                        break;
+                }
             }
 
+            if (saveDialog.ShowDialog() == DialogResult.OK) {
+                Bitmap clonedPic;
 
-            if (s.ShowDialog() == DialogResult.OK)
-            {
-                Bitmap clonedPic = (Bitmap)picMain.Image;
+                if (!picMain.SelectionRegion.IsEmpty) {
+                    clonedPic = (Bitmap)picMain.GetSelectedImage();
+                }
+                else {
+                    clonedPic = (Bitmap)picMain.Image;
+                }
 
-                switch (s.FilterIndex)
-                {
+                // display saving msg
+                ShowToastMsg(string.Format(Configs.Language.Items[$"{Name}._SavingImage"], saveDialog.FileName), 2000);
+
+                Local.SaveAsFilterIndex = saveDialog.FilterIndex;
+                switch (saveDialog.FilterIndex) {
                     case 1:
                     case 4:
                     case 6:
                     case 7:
-                        Interpreter.SaveImage(clonedPic, s.FileName);
+                        Heart.Photo.Save(clonedPic, saveDialog.FileName, quality: Configs.ImageEditQuality);
                         break;
                     case 2:
-                        clonedPic.Save(s.FileName, ImageFormat.Emf);
+                        clonedPic.Save(saveDialog.FileName, ImageFormat.Emf);
                         break;
                     case 3:
-                        clonedPic.Save(s.FileName, ImageFormat.Exif);
+                        clonedPic.Save(saveDialog.FileName, ImageFormat.Exif);
                         break;
                     case 5:
-                        clonedPic.Save(s.FileName, ImageFormat.Icon);
+                        clonedPic.Save(saveDialog.FileName, ImageFormat.Icon);
                         break;
                     case 8:
-                        clonedPic.Save(s.FileName, ImageFormat.Tiff);
+                        Heart.Photo.Save(clonedPic, saveDialog.FileName, (int)MagickFormat.Jxl, quality: Configs.ImageEditQuality);
                         break;
                     case 9:
-                        clonedPic.Save(s.FileName, ImageFormat.Wmf);
+                        clonedPic.Save(saveDialog.FileName, ImageFormat.Tiff);
                         break;
                     case 10:
-                        using (MemoryStream ms = new MemoryStream())
-                        {
-                            try
-                            {
-                                clonedPic.Save(ms, ImageFormat.Png);
-                                string base64string = "data:image/png;base64," + Convert.ToBase64String(ms.ToArray());
-
-                                using (StreamWriter fs = new StreamWriter(s.FileName))
-                                {
-                                    await fs.WriteAsync(base64string);
-                                    fs.Flush();
+                        clonedPic.Save(saveDialog.FileName, ImageFormat.Wmf);
+                        break;
+                    default:
+                        using (var ms = new MemoryStream()) {
+                            try {
+                                // temporary data or selected region
+                                if (Local.IsTempMemoryData || !picMain.SelectionRegion.IsEmpty) {
+                                    await Heart.Photo.SaveAsBase64Async(clonedPic, saveDialog.FileName, ImageFormat.Png).ConfigureAwait(true);
+                                }
+                                else {
+                                    await Heart.Photo.SaveAsBase64Async(
+                                        Local.ImageList.GetFileName(Local.CurrentIndex),
+                                        saveDialog.FileName,
+                                        clonedPic.RawFormat).ConfigureAwait(true);
                                 }
                             }
-                            catch (Exception ex)
-                            {
-                                MessageBox.Show("Sorry, ImageGlass cannot convert this image because this error: \n" + ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            catch (Exception ex) {
+                                MessageBox.Show(Configs.Language.Items[$"{Name}._SaveImageError"] + ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
                             }
                         }
 
                         break;
                 }
 
-                // release resources
-                clonedPic.Dispose();
-
-                //display successful msg
-                if (File.Exists(s.FileName)) {
-                    DisplayTextMessage(string.Format(GlobalSetting.LangPack.Items["frmMain._SaveImage"], s.FileName), 2000);
+                // display successful msg
+                if (File.Exists(saveDialog.FileName)) {
+                    ShowToastMsg(string.Format(Configs.Language.Items[$"{Name}._SaveImage"], saveDialog.FileName), 2000);
                 }
             }
-            
         }
 
-        private void mnuMainRefresh_Click(object sender, EventArgs e)
-        {
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+        private void mnuMainRefresh_Click(object sender, EventArgs e) {
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainReloadImage_Click(object sender, EventArgs e)
-        {
+        private void mnuMainReloadImage_Click(object sender, EventArgs e) {
             //Reload the viewing image
-            NextPic(step: 0, isKeepZoomRatio: false, isSkipCache: true);
+            _ = NextPicAsync(step: 0, isKeepZoomRatio: false, isSkipCache: true);
         }
 
-        private void mnuMainEditImage_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.IsImageError)
-            {
-                return;
-            }
+        private void MnuMainReloadImageList_Click(object sender, EventArgs e) {
+            // update image list
+            _ = PrepareLoadingAsync(Local.ImageList.FileNames, Local.ImageList.GetFileName(Local.CurrentIndex));
+        }
 
+        private void mnuOpenWith_Click(object sender, EventArgs e) {
+            using var p = new Process();
+            p.StartInfo.FileName = "openwith";
+
+            // Build the arguments
+            var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
+            p.StartInfo.Arguments = $"\"{filename}\"";
+
+            // show error dialog
+            p.StartInfo.ErrorDialog = true;
+
+            try {
+                p.Start();
+            }
+            catch { }
+        }
+
+        private void mnuMainEditImage_Click(object sender, EventArgs e) {
             // Viewing image filename
-            string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+            var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
 
             // If viewing image is temporary memory data
-            if (LocalSetting.IsTempMemoryData)
-            {
+            if (Local.IsTempMemoryData) {
                 // Save to temp file
                 filename = SaveTemporaryMemoryData();
 
                 EditByDefaultApp();
             }
-            else
-            {
+            else {
                 // Get extension
                 var ext = Path.GetExtension(filename).ToLower();
 
-                // Get association App for editing
-                var assoc = GlobalSetting.GetImageEditingAssociationFromList(ext);
+                // Get EditApp for editing
+                var app = Configs.GetEditApp(ext);
 
-                if (assoc != null && File.Exists(assoc.AppPath))
-                {
+                if (app != null && File.Exists(app.AppPath)) {
                     // Open configured app for editing
-                    Process p = new Process();
-                    p.StartInfo.FileName = assoc.AppPath;
+                    using var p = new Process();
+                    p.StartInfo.FileName = app.AppPath;
 
-                    //Build the arguments
-                    var args = assoc.AppArguments.Replace(ImageEditingAssociation.FileMacro, filename);
+                    // Build the arguments
+                    var args = app.AppArguments.Replace(EditApp.FileMacro, filename);
                     p.StartInfo.Arguments = $"{args}";
 
-                    //show error dialog
+                    // show error dialog
                     p.StartInfo.ErrorDialog = true;
 
-                    try
-                    {
+                    try {
                         p.Start();
+
+                        RunActionAfterEditing();
                     }
-                    catch (Exception)
-                    { }
+                    catch { }
                 }
                 else // Edit by default associated app
                 {
@@ -3959,507 +4344,440 @@ namespace ImageGlass
                 }
             }
 
-            void EditByDefaultApp()
-            {
-                Process p = new Process();
+            void EditByDefaultApp() {
+                using var p = new Process();
                 p.StartInfo.FileName = filename;
                 p.StartInfo.Verb = "edit";
 
-                //show error dialog
+                // show error dialog
                 p.StartInfo.ErrorDialog = true;
 
-                try
-                {
+                try {
                     p.Start();
+
+                    RunActionAfterEditing();
                 }
-                catch (Exception)
-                { }
+                catch { }
             }
         }
 
-        private void mnuMainViewNext_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.ImageList.Length < 1)
-            {
-                return;
-            }
 
-            NextPic(1);
+        private void mnuMainViewNext_Click(object sender, EventArgs e) {
+            _ = NextPicAsync(1);
         }
 
-        private void mnuMainViewPrevious_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.ImageList.Length < 1)
-            {
-                return;
-            }
-
-            NextPic(-1);
+        private void mnuMainViewPrevious_Click(object sender, EventArgs e) {
+            _ = NextPicAsync(-1);
         }
 
-        private void mnuMainGoto_Click(object sender, EventArgs e)
-        {
-            int n = GlobalSetting.CurrentIndex;
-            // KBR 20190302 init to current index
-            string s = (n+1).ToString();
+        private void mnuMainGoto_Click(object sender, EventArgs e) {
+            var newIndex = Local.CurrentIndex;
+            var value = (newIndex + 1).ToString();
 
-            if (InputBox.ShowDiaLog("Message", GlobalSetting.LangPack.Items["frmMain._GotoDialogText"], s, true, this.TopMost) == DialogResult.OK)
-            {
-                s = InputBox.Message;
+            if (InputBox.ShowDialog(
+                theme: Configs.Theme,
+                message: Configs.Language.Items[$"{Name}._GotoDialogText"],
+                defaultValue: value,
+                isNumberOnly: true,
+                topMost: this.TopMost,
+                filterOnKeyPressed: true) == DialogResult.OK) {
+                value = InputBox.Message;
             }
 
-            if (int.TryParse(s, out n))
-            {
-                n--;
+            if (int.TryParse(value, out newIndex)) {
+                newIndex--;
                 // KBR 20190302 have out-of-range values go to beginning/end as appropriate
-                if (n < 1)
-                    n = 0;
-                else if (n >= GlobalSetting.ImageList.Length)
-                    n = GlobalSetting.ImageList.Length - 1;
+                if (newIndex < 1)
+                    newIndex = 0;
+                else if (newIndex >= Local.ImageList.Length)
+                    newIndex = Local.ImageList.Length - 1;
 
-                GlobalSetting.CurrentIndex = n;
-                NextPic(0);
+                Local.CurrentIndex = newIndex;
+                _ = NextPicAsync(0);
             }
         }
 
-        private void mnuMainGotoFirst_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.CurrentIndex = 0;
-            NextPic(0);
+        private void mnuMainGotoFirst_Click(object sender, EventArgs e) {
+            Local.CurrentIndex = 0;
+            _ = NextPicAsync(0);
         }
 
-        private void mnuMainGotoLast_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.CurrentIndex = GlobalSetting.ImageList.Length - 1;
-            NextPic(0);
+        private void mnuMainGotoLast_Click(object sender, EventArgs e) {
+            Local.CurrentIndex = Local.ImageList.Length - 1;
+            _ = NextPicAsync(0);
         }
 
-        private void mnuMainFullScreen_Click(object sender, EventArgs e)
-        {
-            //enter full screen
-            if (!GlobalSetting.IsFullScreen)
-            {
-                mnuMainFullScreen.Checked = 
-                    btnFullScreen.Checked = 
-                    GlobalSetting.IsFullScreen = true;
+        private void mnuMainPrevPage_Click(object sender, EventArgs e) {
+            Local.CurrentPageIndex--;
+            _ = NextPicAsync(0, pageIndex: Local.CurrentPageIndex);
+        }
+
+        private void mnuMainNextPage_Click(object sender, EventArgs e) {
+            Local.CurrentPageIndex++;
+            _ = NextPicAsync(0, pageIndex: Local.CurrentPageIndex);
+        }
+
+        private void mnuMainFirstPage_Click(object sender, EventArgs e) {
+            Local.CurrentPageIndex = 0;
+            _ = NextPicAsync(0, pageIndex: Local.CurrentPageIndex);
+        }
+
+        private async void mnuMainLastPage_Click(object sender, EventArgs e) {
+            var img = await Local.ImageList.GetImgAsync(Local.CurrentIndex).ConfigureAwait(true);
+
+            Local.CurrentPageIndex = img.PageCount - 1;
+            _ = NextPicAsync(0, pageIndex: Local.CurrentPageIndex);
+        }
+
+        private void mnuMainFullScreen_Click(object sender, EventArgs e) {
+            // enter full screen
+            if (!Configs.IsFullScreen) {
+                mnuMainFullScreen.Checked =
+                    btnFullScreen.Checked =
+                    Configs.IsFullScreen = true;
 
                 FullScreenMode(enabled: true);
 
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._FullScreenMessage"]
-                    , 2000);
+                ShowToastMsg(
+                    string.Format(
+                        Configs.Language.Items[$"{Name}._FullScreenMessage"],
+                        mnuMainFullScreen.ShortcutKeyDisplayString),
+                    2000);
             }
-            //exit full screen
-            else
-            {
-                mnuMainFullScreen.Checked = 
-                    btnFullScreen.Checked = 
-                    GlobalSetting.IsFullScreen = false;
+            // exit full screen
+            else {
+                mnuMainFullScreen.Checked =
+                    btnFullScreen.Checked =
+                    Configs.IsFullScreen = false;
 
                 FullScreenMode(enabled: false);
-                
             }
         }
 
-        private void mnuMainSlideShowStart_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.ImageList.Length < 1)
-            {
+        private void mnuMainSlideShowStart_Click(object sender, EventArgs e) {
+            if (Local.ImageList.Length < 1) {
                 return;
             }
 
-            //not performing
-            if (!GlobalSetting.IsPlaySlideShow)
-            {
+            // not performing
+            if (!Configs.IsSlideshow) {
                 picMain.BackColor = Color.Black;
 
                 // enter full screen
-                FullScreenMode(enabled: true, changeWindowState: !GlobalSetting.IsFullScreen, onlyShowViewer: true);
+                FullScreenMode(enabled: true, changeWindowState: !Configs.IsFullScreen, onlyShowViewer: true);
 
                 //perform slideshow
                 timSlideShow.Enabled = true;
 
-                GlobalSetting.IsPlaySlideShow = true;
+                Configs.IsSlideshow = true;
+                SysExecutionState.PreventSleep();
 
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._SlideshowMessage"], 2000);
+                ShowToastMsg(Configs.Language.Items[$"{Name}._SlideshowMessage"], 2000);
             }
-            //performing
-            else
-            {
+            // performing
+            else {
                 mnuMainSlideShowExit_Click(null, null);
             }
         }
 
-        private void mnuMainSlideShowPause_Click(object sender, EventArgs e)
-        {
-            //performing
-            if (timSlideShow.Enabled)
-            {
+        private void mnuMainSlideShowPause_Click(object sender, EventArgs e) {
+            // performing
+            if (timSlideShow.Enabled) {
                 timSlideShow.Enabled = false;
 
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._SlideshowMessagePause"], 2000);
+                ShowToastMsg(Configs.Language.Items[$"{Name}._SlideshowMessagePause"], 2000);
             }
-            else
-            {
+            else {
                 timSlideShow.Enabled = true;
 
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._SlideshowMessageResume"], 2000);
+                ShowToastMsg(Configs.Language.Items[$"{Name}._SlideshowMessageResume"], 2000);
             }
-
         }
 
-        private void mnuMainSlideShowExit_Click(object sender, EventArgs e)
-        {
+        private void mnuMainSlideShowExit_Click(object sender, EventArgs e) {
             timSlideShow.Enabled = false;
-            GlobalSetting.IsPlaySlideShow = false;
+            Configs.IsSlideshow = false;
+            SysExecutionState.AllowSleep();
 
-            picMain.BackColor = GlobalSetting.BackgroundColor;
+            picMain.BackColor = Configs.BackgroundColor;
 
             // exit full screen
-            FullScreenMode(enabled: false, changeWindowState: !GlobalSetting.IsFullScreen, onlyShowViewer: true);
-
+            FullScreenMode(enabled: false, changeWindowState: !Configs.IsFullScreen, onlyShowViewer: true);
         }
-        
-        private void mnuMainPrint_Click(object sender, EventArgs e)
-        {
+
+        private void mnuMainPrint_Click(object sender, EventArgs e) {
             //image error
-            if (picMain.Image == null)
-            {
+            if (picMain.Image == null) {
                 return;
             }
 
-            //save image to temp file
-            string temFile = "";
-            temFile = SaveTemporaryMemoryData();
-            
+            // save image to temp file
+            var temFile = SaveTemporaryMemoryData();
 
-            Process p = new Process();
+            using var p = new Process();
             p.StartInfo.FileName = temFile;
             p.StartInfo.Verb = "print";
 
-            //show error dialog
+            // show error dialog
             p.StartInfo.ErrorDialog = true;
 
-            try
-            {
+            try {
                 p.Start();
             }
-            catch (Exception)
-            { }
-
-        }
-
-        private void mnuMainRotateCounterclockwise_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
-                return;
-            }
-
-            if (picMain.CanAnimate)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
-                return;
-            }
-
-            picMain.Image = Interpreter.RotateImage(picMain.Image, 270);
-
-            try
-            {
-                // Save the image path for saving
-                LocalSetting.ImageModifiedPath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-            }
-            catch { }
-            ApplyZoomMode(GlobalSetting.ZoomMode);
-        }
-
-        private void mnuMainRotateClockwise_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
-                return;
-            }
-
-            if (picMain.CanAnimate)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
-                return;
-            }
-
-            picMain.Image = Interpreter.RotateImage(picMain.Image, 90);
-
-            try
-            {
-                // Save the image path for saving
-                LocalSetting.ImageModifiedPath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-            }
-            catch { }
-            ApplyZoomMode(GlobalSetting.ZoomMode);
-        }
-
-        private void mnuMainFlipHorz_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
-                return;
-            }
-
-            if (picMain.CanAnimate)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
-                return;
-            }
-
-            picMain.Image = Interpreter.Flip(picMain.Image, horz: true);
-
-            try
-            {
-                // Save the image path for saving
-                LocalSetting.ImageModifiedPath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-            }
             catch { }
         }
 
-        private void mnuMainFlipVert_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+        private async void mnuMainRotateCounterclockwise_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) return;
+
+            if (picMain.CanAnimate) {
+                ShowToastMsg(Configs.Language.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
                 return;
             }
 
-            if (picMain.CanAnimate)
-            {
-                DisplayTextMessage(GlobalSetting.LangPack.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
-                return;
-            }
+            picMain.Image = await Heart.Photo.RotateImageAsync(new Bitmap(picMain.Image), 270).ConfigureAwait(true);
 
-            picMain.Image = Interpreter.Flip(picMain.Image, horz: false);
-
-            try
-            {
+            if (!Local.IsTempMemoryData) {
                 // Save the image path for saving
-                LocalSetting.ImageModifiedPath = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
+                Local.ImageModifiedPath = Local.ImageList.GetFileName(Local.CurrentIndex);
             }
-            catch { }
+
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainZoomIn_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+        private async void mnuMainRotateClockwise_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) return;
+
+            if (picMain.CanAnimate) {
+                ShowToastMsg(Configs.Language.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
+                return;
+            }
+
+            picMain.Image = await Heart.Photo.RotateImageAsync(new Bitmap(picMain.Image), 90).ConfigureAwait(true);
+
+            if (!Local.IsTempMemoryData) {
+                // Save the image path for saving
+                Local.ImageModifiedPath = Local.ImageList.GetFileName(Local.CurrentIndex);
+            }
+
+            ApplyZoomMode(Configs.ZoomMode);
+        }
+
+        private async void mnuMainFlipHorz_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) return;
+
+            if (picMain.CanAnimate) {
+                ShowToastMsg(Configs.Language.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
+                return;
+            }
+
+            picMain.Image = await Heart.Photo.FlipAsync(new Bitmap(picMain.Image), isHorzontal: true).ConfigureAwait(true);
+
+            if (!Local.IsTempMemoryData) {
+                // Save the image path for saving
+                Local.ImageModifiedPath = Local.ImageList.GetFileName(Local.CurrentIndex);
+            }
+        }
+
+        private async void mnuMainFlipVert_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) return;
+
+            if (picMain.CanAnimate) {
+                ShowToastMsg(Configs.Language.Items[$"{this.Name}._CannotRotateAnimatedFile"], 1000);
+                return;
+            }
+
+            picMain.Image = await Heart.Photo.FlipAsync(new Bitmap(picMain.Image), isHorzontal: false).ConfigureAwait(true);
+
+            if (!Local.IsTempMemoryData) {
+                // Save the image path for saving
+                Local.ImageModifiedPath = Local.ImageList.GetFileName(Local.CurrentIndex);
+            }
+        }
+
+        private void mnuMainZoomIn_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) {
                 return;
             }
 
             picMain.ZoomIn();
         }
 
-        private void mnuMainZoomOut_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+        private void mnuMainZoomOut_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) {
                 return;
             }
 
             picMain.ZoomOut();
         }
 
-        private void mnuMainActualSize_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+        private void mnuMainActualSize_Click(object sender, EventArgs e) {
+            if (picMain.Image == null) {
                 return;
             }
 
             picMain.ActualSize();
-            picMain.CenterToImage();
+
+            if (Configs.IsCenterImage) {
+                picMain.CenterToImage();
+            }
+            else {
+                picMain.ScrollTo(0, 0, 0, 0);
+            }
         }
-        
-        private void mnuMainWindowAdaptImage_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image == null)
-            {
+
+        private void mnuWindowFit_Click(object sender, EventArgs e) {
+            Configs.IsWindowFit = !Configs.IsWindowFit;
+            mnuWindowFit.Checked =
+                btnWindowFit.Checked = Configs.IsWindowFit;
+
+            if (picMain.Image == null) {
                 return;
             }
 
-            Rectangle screen = Screen.FromControl(this).WorkingArea;
-            WindowState = FormWindowState.Normal;
-
-            //if image size is bigger than screen
-            if (picMain.Image.Width >= screen.Width || picMain.Height >= screen.Height)
-            {
-                Width = screen.Width;
-                Height = screen.Height;
-            }
+            if (Configs.IsWindowFit)
+                WindowFitMode();
             else
-            {
-                Size = new Size(Width += picMain.Image.Width - picMain.Width,
-                                Height += picMain.Image.Height - picMain.Height);
-
-                picMain.Bounds = new Rectangle(Point.Empty, picMain.Image.Size);
-            }
-
-            //reset zoom
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+                ApplyZoomMode(Configs.ZoomMode);
         }
 
-        
-        private void mnuMainAutoZoom_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.ZoomMode = ZoomMode.AutoZoom;
+        private void mnuMainAutoZoom_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.AutoZoom;
 
             SelectUIZoomMode();
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainScaleToWidth_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.ZoomMode = ZoomMode.ScaleToWidth;
+        private void mnuMainScaleToWidth_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.ScaleToWidth;
 
             SelectUIZoomMode();
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainScaleToHeight_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.ZoomMode = ZoomMode.ScaleToHeight;
+        private void mnuMainScaleToHeight_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.ScaleToHeight;
 
             SelectUIZoomMode();
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainScaleToFit_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.ZoomMode = ZoomMode.ScaleToFit;
+        private void mnuMainScaleToFit_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.ScaleToFit;
 
             SelectUIZoomMode();
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
-        private void mnuMainLockZoomRatio_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.ZoomMode = ZoomMode.LockZoomRatio;
+        private void mnuMainScaleToFill_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.ScaleToFill;
 
             SelectUIZoomMode();
-            ApplyZoomMode(GlobalSetting.ZoomMode);
+            ApplyZoomMode(Configs.ZoomMode);
         }
 
+        private void mnuMainLockZoomRatio_Click(object sender, EventArgs e) {
+            Configs.ZoomMode = ZoomMode.LockZoomRatio;
 
-        private void mnuMainRename_Click(object sender, EventArgs e)
-        {
+            SelectUIZoomMode();
+            ApplyZoomMode(Configs.ZoomMode);
+        }
+
+        private void mnuMainRename_Click(object sender, EventArgs e) {
             RenameImage();
         }
 
-        private void mnuMainMoveToRecycleBin_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                if (!File.Exists(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)))
-                {
+        private void mnuMainMoveToRecycleBin_Click(object sender, EventArgs e) {
+            try {
+                if (!File.Exists(Local.ImageList.GetFileName(Local.CurrentIndex))) {
                     return;
                 }
             }
             catch { return; }
 
-            DialogResult msg = DialogResult.Yes;
+            var msg = DialogResult.Yes;
 
-            if (GlobalSetting.IsConfirmationDelete)
-            {
-                msg = MessageBox.Show(string.Format(GlobalSetting.LangPack.Items["frmMain._DeleteDialogText"], GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)), GlobalSetting.LangPack.Items["frmMain._DeleteDialogTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (Configs.IsConfirmationDelete) {
+                msg = MessageBox.Show(string.Format(Configs.Language.Items[$"{Name}._DeleteDialogText"], Local.ImageList.GetFileName(Local.CurrentIndex)), Configs.Language.Items[$"{Name}._DeleteDialogTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             }
 
-            if (msg == DialogResult.Yes)
-            {
-                string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-                try
-                {
+            if (msg == DialogResult.Yes) {
+                var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
+                try {
                     ImageInfo.DeleteFile(filename, isMoveToRecycleBin: true);
                 }
-                catch (Exception ex)
-                {
+                catch (Exception ex) {
                     MessageBox.Show(ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }
 
-        private void mnuMainDeleteFromHardDisk_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                if (!File.Exists(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)))
-                {
+        private void mnuMainDeleteFromHardDisk_Click(object sender, EventArgs e) {
+            try {
+                if (!File.Exists(Local.ImageList.GetFileName(Local.CurrentIndex))) {
                     return;
                 }
             }
             catch { return; }
 
-            DialogResult msg = MessageBox.Show(string.Format(GlobalSetting.LangPack.Items["frmMain._DeleteDialogText"], GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex)), GlobalSetting.LangPack.Items["frmMain._DeleteDialogTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            var msg = DialogResult.Yes;
 
-            if (msg == DialogResult.Yes)
-            {
-                
+            if (Configs.IsConfirmationDelete) {
+                msg = MessageBox.Show(string.Format(Configs.Language.Items[$"{Name}._DeleteDialogText"], Local.ImageList.GetFileName(Local.CurrentIndex)), Configs.Language.Items[$"{Name}._DeleteDialogTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            }
 
-                string filename = GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex);
-                try
-                {
-                    ImageInfo.DeleteFile(filename, isMoveToRecycleBin: false);                    
+            if (msg == DialogResult.Yes) {
+                var filename = Local.ImageList.GetFileName(Local.CurrentIndex);
+                try {
+                    ImageInfo.DeleteFile(filename, isMoveToRecycleBin: false);
                 }
-                catch (Exception ex)
-                {
+                catch (Exception ex) {
                     MessageBox.Show(ex.Message, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }
 
-        private void mnuMainExtractFrames_Click(object sender, EventArgs e)
-        {
-            if (!(sender as ToolStripMenuItem).Enabled) // Shortcut keys still work even when menu is disabled!
+        private async void mnuMainExtractPages_Click(object sender, EventArgs e) {
+            // Shortcut keys still work even when menu is disabled!
+            if (!(sender as ToolStripMenuItem).Enabled || Local.ImageError != null)
                 return;
 
-            if (!GlobalSetting.IsImageError)
-            {
-                FolderBrowserDialog f = new FolderBrowserDialog
-                {
-                    Description = GlobalSetting.LangPack.Items["frmMain._ExtractFrameText"],
-                    ShowNewFolderButton = true
-                };
+            using var fb = new FolderBrowserDialog() {
+                Description = Configs.Language.Items[$"{Name}._ExtractPageText"],
+                ShowNewFolderButton = true
+            };
+            var result = fb.ShowDialog();
 
-                DialogResult res = f.ShowDialog();
+            if (result == DialogResult.OK && Directory.Exists(fb.SelectedPath)) {
+                var img = await Local.ImageList.GetImgAsync(Local.CurrentIndex).ConfigureAwait(true);
+                await img.SaveImagePagesAsync(fb.SelectedPath).ConfigureAwait(true);
 
-                if (res == DialogResult.OK && Directory.Exists(f.SelectedPath))
-                {
-                    Animation ani = new Animation();
-                    ani.ExtractAllFrames(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex), f.SelectedPath);
-                }
-
-                f = null;
+                ShowToastMsg(Configs.Language.Items[$"{Name}._PageExtractComplete"], 2000);
             }
         }
 
         // ReSharper disable once EmptyGeneralCatchClause
-        private void mnuMainSetAsDesktop_Click(object sender, EventArgs e)
-        {
-            var isError = false;
-            
-            try
-            {
-                // save the current image data to temp file
-                var imgFile = SaveTemporaryMemoryData();
+        private void mnuMainSetAsDesktop_Click(object sender, EventArgs e) {
+            _ = Task.Run(() => {
+                var isError = false;
 
-                using (Process p = new Process())
-                {
+                try {
+                    // save the current image data to temp file
+                    var imgFile = SaveTemporaryMemoryData();
+
+                    using var p = new Process();
                     var args = string.Format("setwallpaper \"{0}\" {1}", imgFile, (int)DesktopWallapaper.Style.Current);
 
                     // Issue #326: first attempt to set wallpaper w/o privs. 
-                    p.StartInfo.FileName = GlobalSetting.StartUpDir("igcmd.exe");
+                    p.StartInfo.FileName = App.StartUpDir("igcmd.exe");
                     p.StartInfo.Arguments = args;
                     p.Start();
 
                     p.WaitForExit();
-                    
 
                     // If that fails due to privs error, re-attempt with admin privs.
-                    if (p.ExitCode == (int) DesktopWallapaper.Result.PrivsFail)
-                    {
-                        p.StartInfo.FileName = GlobalSetting.StartUpDir("igtasks.exe");
+                    if (p.ExitCode == (int)DesktopWallapaper.Result.PrivsFail) {
+                        p.StartInfo.FileName = App.StartUpDir("igtasks.exe");
                         p.StartInfo.Arguments = args;
                         p.Start();
 
@@ -4468,231 +4786,205 @@ namespace ImageGlass
                         // success or error
                         isError = p.ExitCode != 0;
                     }
-                    else
-                    {
+                    else {
                         // success or error
                         isError = p.ExitCode != 0;
                     }
                 }
-            }
-            catch { isError = true; }
+                catch { isError = true; }
 
-            // show result message
-            if (isError)
-            {
-                var msg = GlobalSetting.LangPack.Items["frmMain._SetBackground_Error"];
-                MessageBox.Show(msg, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            else
-            {
-                var msg = GlobalSetting.LangPack.Items["frmMain._SetBackground_Success"];
-                DisplayTextMessage(msg, 2000);
-            }
+                // show result message
+                if (isError) {
+                    var msg = Configs.Language.Items[$"{Name}._SetBackground_Error"];
+                    MessageBox.Show(msg, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                else {
+                    var msg = Configs.Language.Items[$"{Name}._SetBackground_Success"];
+                    ShowToastMsg(msg, 2000);
+                }
+            });
         }
 
+        private async void mnuMainSetAsLockImage_Click(object sender, EventArgs e) {
+            if (!_isWindows10)
+                return; // Do nothing - running Windows 8 or earlier
 
-        private async void mnuMainSetAsLockImage_Click(object sender, EventArgs e)
-        {
             var isError = false;
 
-            try
-            {
-                await Task.Run(() =>
-                {
+            try {
+                await Task.Run(() => {
                     // save the current image data to temp file
                     var imgFile = SaveTemporaryMemoryData();
 
-                    using (Process p = new Process())
-                    {
-                        var args = string.Format("setlockimage \"{0}\"", imgFile);
+                    using var p = new Process();
+                    var args = string.Format("setlockimage \"{0}\"", imgFile);
 
-                        p.StartInfo.FileName = GlobalSetting.StartUpDir("igcmdWin10.exe");
-                        p.StartInfo.Arguments = args;
-                        p.EnableRaisingEvents = true;
-                        p.Start();
+                    p.StartInfo.FileName = App.StartUpDir("igcmdWin10.exe");
+                    p.StartInfo.Arguments = args;
+                    p.EnableRaisingEvents = true;
+                    p.Start();
 
-                        p.WaitForExit();
+                    p.WaitForExit();
 
-                        // success or error
-                        isError = p.ExitCode != 0;
-                    }
-                });
+                    // success or error
+                    isError = p.ExitCode != 0;
+                }).ConfigureAwait(true);
             }
             catch { isError = true; }
 
-
             // show result message
-            if (isError)
-            {
-                var msg = GlobalSetting.LangPack.Items["frmMain._SetLockImage_Error"];
+            if (isError) {
+                var msg = Configs.Language.Items[$"{Name}._SetLockImage_Error"];
                 MessageBox.Show(msg, "", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-            else
-            {
-                var msg = GlobalSetting.LangPack.Items["frmMain._SetLockImage_Success"];
-                DisplayTextMessage(msg, 2000);
+            else {
+                var msg = Configs.Language.Items[$"{Name}._SetLockImage_Success"];
+                ShowToastMsg(msg, 2000);
             }
         }
 
-
-        private void mnuMainImageLocation_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.ImageList.Length > 0)
-            {
-                Process.Start("explorer.exe", "/select,\"" +
-                    GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex) + "\"");
+        private void mnuMainImageLocation_Click(object sender, EventArgs e) {
+            if (Local.ImageList.Length > 0) {
+                try {
+                    Explorer.OpenFolderAndSelectItem(Local.ImageList.GetFileName(Local.CurrentIndex));
+                }
+                catch {
+                    Process.Start("explorer.exe", "/select,\"" +
+                        Local.ImageList.GetFileName(Local.CurrentIndex) + "\"");
+                }
             }
         }
 
-        private void mnuMainImageProperties_Click(object sender, EventArgs e)
-        {
-            if (GlobalSetting.ImageList.Length > 0)
-            {
-                ImageInfo.DisplayFileProperties(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex),
-                                                Handle);
+        private void mnuMainImageProperties_Click(object sender, EventArgs e) {
+            if (Local.ImageList.Length > 0) {
+                ImageInfo.DisplayFileProperties(Local.ImageList.GetFileName(Local.CurrentIndex), Handle);
             }
         }
 
-        private void mnuMainCopy_Click(object sender, EventArgs e)
-        {
+        private void mnuMainCopy_Click(object sender, EventArgs e) {
             CopyMultiFiles();
         }
 
-        private void mnuMainCut_Click(object sender, EventArgs e)
-        {
-            CutMultiFiles();
+        private void mnuMainCut_Click(object sender, EventArgs e) {
+            _ = CutMultiFilesAsync();
         }
 
-        private void mnuMainCopyImageData_Click(object sender, EventArgs e)
-        {
-            if (picMain.Image != null)
-            {
-                Clipboard.SetImage(picMain.Image);
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._CopyImageData"], 1000);
+        private void mnuMainCopyImageData_Click(object sender, EventArgs e) {
+            Image img;
+            if (!picMain.SelectionRegion.IsEmpty) {
+                img = picMain.GetSelectedImage();
+            }
+            else {
+                img = picMain.Image;
+            }
+
+            if (img != null) {
+                Clipboard.SetImage(img);
+                ShowToastMsg(Configs.Language.Items[$"{Name}._CopyImageData"], 1000);
             }
         }
 
-        private void mnuMainCopyImagePath_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                Clipboard.SetText(GlobalSetting.ImageList.GetFileName(GlobalSetting.CurrentIndex));
+        private void mnuMainCopyImagePath_Click(object sender, EventArgs e) {
+            try {
+                Clipboard.SetText(Local.ImageList.GetFileName(Local.CurrentIndex));
             }
             catch { }
         }
 
-        private void mnuMainClearClipboard_Click(object sender, EventArgs e)
-        {
-            //clear copied files in clipboard
-            if (LocalSetting.StringClipboard.Count > 0)
-            {
-                LocalSetting.StringClipboard = new List<string>();
+        private void mnuMainClearClipboard_Click(object sender, EventArgs e) {
+            // clear copied files in clipboard
+            if (Local.StringClipboard.Count > 0) {
+                Local.StringClipboard = new List<string>();
                 Clipboard.Clear();
-                DisplayTextMessage(GlobalSetting.LangPack.Items["frmMain._ClearClipboard"], 1000);
+                ShowToastMsg(Configs.Language.Items[$"{Name}._ClearClipboard"], 1000);
             }
         }
 
+        private void mnuMainToolbar_Click(object sender, EventArgs e) {
+            Configs.IsShowToolBar = !Configs.IsShowToolBar;
 
-        private void mnuMainToolbar_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.IsShowToolBar = !GlobalSetting.IsShowToolBar;
-            if (GlobalSetting.IsShowToolBar)
-            {
-                //Hien
-                toolMain.Visible = true;
+            toolMain.Visible = Configs.IsShowToolBar;
+            mnuMainToolbar.Checked = Configs.IsShowToolBar;
+
+            // Issue #554 
+            if (!_isManuallyZoomed) {
+                // Resize image to adapt when toolbar turned off
+                ApplyZoomMode(Configs.ZoomMode);
             }
-            else
-            {
-                //An
-                toolMain.Visible = false;
-            }
-            mnuMainToolbar.Checked = GlobalSetting.IsShowToolBar;
         }
 
-        private void mnuMainThumbnailBar_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.IsShowThumbnail = !GlobalSetting.IsShowThumbnail;
+        private void mnuMainThumbnailBar_Click(object sender, EventArgs e) {
+            Configs.IsShowThumbnail = !Configs.IsShowThumbnail;
 
-            sp1.Panel2Collapsed = !GlobalSetting.IsShowThumbnail;
-            btnThumb.Checked = GlobalSetting.IsShowThumbnail;
+            sp1.Panel2Collapsed = !Configs.IsShowThumbnail;
+            btnThumb.Checked = Configs.IsShowThumbnail;
 
-            if (GlobalSetting.IsShowThumbnail)
-            {
-                float scaleFactor = ((float)DPIScaling.CurrentDPI) / DPIScaling.DPI_DEFAULT;
+            if (Configs.IsShowThumbnail) {
+                var scaleFactor = ((float)DPIScaling.CurrentDPI) / DPIScaling.DPI_DEFAULT;
+                var hScrollHeight = (7 * scaleFactor) - 1;
 
-                // calculate the gap
-                int gap = 0;
-                double hScrollHeight = 7 * scaleFactor - 1;
-
-                if (GlobalSetting.IsShowThumbnailScrollbar)
-                {
+                if (Configs.IsShowThumbnailScrollbar) {
                     hScrollHeight = SystemInformation.HorizontalScrollBarHeight;
                 }
-                gap = (int)((hScrollHeight * scaleFactor) + (25 / scaleFactor * 1.05));
 
-                //show
-                var tb = new ThumbnailItemInfo(GlobalSetting.ThumbnailDimension, GlobalSetting.IsThumbnailHorizontal);
-                int minSize = tb.GetTotalDimension() + gap;
-                //sp1.Panel2MinSize = tb.GetTotalDimension() + gap;
+                var gap = (uint)((hScrollHeight * scaleFactor) + (25 / scaleFactor * 1.05));
+                var thumbItem = new ThumbnailItemInfo(Configs.ThumbnailDimension, Configs.IsThumbnailHorizontal);
+                var minSize = thumbItem.GetTotalDimension() + gap;
 
-
-                int splitterDistance = Math.Abs(sp1.Height - minSize);
-
-                if (GlobalSetting.IsThumbnailHorizontal)
-                {
+                if (Configs.IsThumbnailHorizontal) {
                     // BOTTOM
                     sp1.SplitterWidth = 1;
                     sp1.Orientation = Orientation.Horizontal;
-                    sp1.SplitterDistance = splitterDistance;
+                    sp1.SplitterDistance = Math.Abs(sp1.Height - (int)minSize);
                     thumbnailBar.View = ImageListView.View.Gallery;
                 }
-                else
-                {
+                else {
                     // RIGHT
-                    sp1.IsSplitterFixed = false; //Allow user to resize
+                    sp1.IsSplitterFixed = false; // Allow user to resize
                     sp1.SplitterWidth = (int)Math.Ceiling(3 * scaleFactor);
                     sp1.Orientation = Orientation.Vertical;
-                    sp1.SplitterDistance = sp1.Width - GlobalSetting.ThumbnailBarWidth;
+
+                    // KBR 20190302 Issue #483: reset splitter width if it gets out of whack somehow
+                    if ((sp1.Width - Configs.ThumbnailBarWidth) < 1) {
+                        minSize = (uint)Math.Min(128, sp1.Width);
+                        Configs.ThumbnailBarWidth = minSize;
+                    }
+
+                    // KBR 20200110 Issue #678 : restore saved thumbnail panel size
+                    sp1.SplitterDistance = sp1.Width - (int)Configs.ThumbnailBarWidth;
                     thumbnailBar.View = ImageListView.View.Thumbnails;
                 }
             }
-            else
-            {
-                //Save thumbnail bar width when closing
-                if (!GlobalSetting.IsThumbnailHorizontal)
-                {
-                    GlobalSetting.ThumbnailBarWidth = sp1.Width - sp1.SplitterDistance;
+            else {
+                // Save thumbnail bar width when closing
+                if (!Configs.IsThumbnailHorizontal) {
+                    Configs.ThumbnailBarWidth = (uint)(sp1.Width - sp1.SplitterDistance);
                 }
                 sp1.SplitterWidth = 1; // right-side splitter will 'flash' unless width reset
             }
-            mnuMainThumbnailBar.Checked = GlobalSetting.IsShowThumbnail;
+            mnuMainThumbnailBar.Checked = Configs.IsShowThumbnail;
             SelectCurrentThumbnail();
 
-            if (!_isManuallyZoomed)
-            {
-                ApplyZoomMode(GlobalSetting.ZoomMode); // Resize image to adapt when thumbbar turned off
+            if (!_isManuallyZoomed) {
+                // Resize image to adapt when thumbbar turned off
+                ApplyZoomMode(Configs.ZoomMode);
             }
         }
 
-        private void mnuMainCheckBackground_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.IsShowCheckerBoard = !GlobalSetting.IsShowCheckerBoard;
-            btnCheckedBackground.Checked = GlobalSetting.IsShowCheckerBoard;
+        private void mnuMainCheckBackground_Click(object sender, EventArgs e) {
+            Configs.IsShowCheckerBoard = !Configs.IsShowCheckerBoard;
+            btnCheckedBackground.Checked = Configs.IsShowCheckerBoard;
 
-            if (btnCheckedBackground.Checked)
-            {
+            if (btnCheckedBackground.Checked) {
                 //show
-                if (GlobalSetting.IsShowCheckerboardOnlyImageRegion)
-                {
+                if (Configs.IsShowCheckerboardOnlyImageRegion) {
                     picMain.GridDisplayMode = ImageBoxGridDisplayMode.Image;
                 }
-                else
-                {
+                else {
                     picMain.GridDisplayMode = ImageBoxGridDisplayMode.Client;
                 }
             }
-            else
-            {
+            else {
                 //hide
                 picMain.GridDisplayMode = ImageBoxGridDisplayMode.None;
             }
@@ -4700,227 +4992,219 @@ namespace ImageGlass
             mnuMainCheckBackground.Checked = btnCheckedBackground.Checked;
         }
 
-        private void mnuMainAlwaysOnTop_Click(object sender, EventArgs e)
-        {
-            TopMost = 
-                mnuMainAlwaysOnTop.Checked = 
-                GlobalSetting.IsWindowAlwaysOnTop = !GlobalSetting.IsWindowAlwaysOnTop;
+        private void mnuFrameless_Click(object sender, EventArgs e) {
+            Configs.IsWindowFrameless = !Configs.IsWindowFrameless;
+            Control[] frameLessMovers = { picMain, toolMain };
+
+            if (Configs.IsWindowFrameless) {
+                this.FormBorderStyle = FormBorderStyle.None;
+
+                // Enable frameless movable
+                this._movableForm.Enable();
+                this._movableForm.Enable(frameLessMovers);
+
+                ShowToastMsg(Configs.Language.Items[$"{Name}._Frameless"], 3000);
+            }
+            else {
+                // Disable frameless movable
+                this._movableForm.Disable();
+                this._movableForm.Disable(frameLessMovers);
+
+                this.FormBorderStyle = FormBorderStyle.Sizable;
+            }
         }
-        
 
-        private void mnuMainColorPicker_Click(object sender, EventArgs e)
-        {
-            LocalSetting.IsShowColorPickerOnStartup = LocalSetting.IsColorPickerToolOpening = mnuMainColorPicker.Checked;
+        private void mnuMainAlwaysOnTop_Click(object sender, EventArgs e) {
+            TopMost =
+                mnuMainAlwaysOnTop.Checked =
+                Configs.IsWindowAlwaysOnTop = !Configs.IsWindowAlwaysOnTop;
+        }
 
-            //open Color Picker tool
-            if (mnuMainColorPicker.Checked)
-            {
-                if (LocalSetting.FColorPicker.IsDisposed)
-                {
-                    LocalSetting.FColorPicker = new frmColorPicker();
-                }
-                LocalSetting.ForceUpdateActions |= MainFormForceUpdateAction.COLOR_PICKER_MENU;
+        private void mnuMainColorPicker_Click(object sender, EventArgs e) {
+            Configs.IsShowColorPickerOnStartup =
+                btnColorPicker.Checked =
+                mnuMainColorPicker.Checked;
 
-                LocalSetting.FColorPicker.SetImageBox(picMain);
-                LocalSetting.FColorPicker.Show(this);
+            ShowColorPickerTool(mnuMainColorPicker.Checked);
+        }
 
+        private void mnuMainPageNav_Click(object sender, EventArgs e) {
+            Configs.IsShowPageNavOnStartup = mnuMainPageNav.Checked;
+
+            ShowPageNavTool(mnuMainPageNav.Checked);
+        }
+
+        private void mnuMainCrop_Click(object sender, EventArgs e) {
+            ShowCropTool(mnuMainCrop.Checked);
+        }
+
+        private void mnuExifTool_Click(object sender, EventArgs e) {
+            if (Local.FExifTool?.IsDisposed != false) {
+                Local.FExifTool = new FrmExifTool();
+            }
+
+            if (!Local.FExifTool.Visible) {
+                Local.FExifTool.TopMost = this.TopMost;
+                Local.FExifTool.Show();
+            }
+
+            if (Configs.IsExifToolAlwaysOnTop) {
+                Local.FExifTool.Owner = this;
                 this.Activate();
             }
-            //Close Color picker tool
-            else
-            {
-                if (LocalSetting.FColorPicker != null)
-                {
-                    LocalSetting.FColorPicker.Close();
-                }
-            }
-
-            
         }
 
-        private void mnuMainSettings_Click(object sender, EventArgs e)
-        {
-            if (LocalSetting.FSetting.IsDisposed)
-            {
-                LocalSetting.FSetting = new frmSetting();
+        private void mnuMainSettings_Click(object sender, EventArgs e) {
+            if (Local.FSetting.IsDisposed) {
+                Local.FSetting = new frmSetting();
             }
 
-            LocalSetting.ForceUpdateActions = MainFormForceUpdateAction.NONE;
-            LocalSetting.FSetting.MainInstance = this;
-            LocalSetting.FSetting.TopMost = this.TopMost;
-            LocalSetting.FSetting.Show();
-            LocalSetting.FSetting.Activate();
+            Local.ForceUpdateActions = ForceUpdateActions.NONE;
+            Local.FSetting.MainInstance = this;
+            Local.FSetting.TopMost = this.TopMost;
+            Local.FSetting.Show();
+            Local.FSetting.Activate();
         }
 
-        private void mnuMainAbout_Click(object sender, EventArgs e)
-        {
-            frmAbout f = new frmAbout();
-            f.TopMost = this.TopMost;
+        private void mnuMainAbout_Click(object sender, EventArgs e) {
+            var f = new frmAbout {
+                TopMost = this.TopMost
+            };
             f.ShowDialog();
         }
 
-        private void mnuMainFirstLaunch_Click(object sender, EventArgs e)
-        {
-            Process p = new Process();
-            p.StartInfo.FileName = GlobalSetting.StartUpDir("igcmd.exe");
+        private void mnuMainFirstLaunch_Click(object sender, EventArgs e) {
+            var p = new Process();
+            p.StartInfo.FileName = App.StartUpDir("igcmd.exe");
             p.StartInfo.Arguments = "firstlaunch";
 
-            try
-            {
+            try {
                 p.Start();
             }
             catch { }
         }
 
-        private void mnuMainCheckForUpdate_Click(object sender, EventArgs e)
-        {
-            Process p = new Process();
-            p.StartInfo.FileName = Path.Combine(Application.StartupPath, "igcmd.exe");
-            p.StartInfo.Arguments = "igupdate";
-            p.Start();
+        private void mnuMainCheckForUpdate_Click(object sender, EventArgs e) {
+            Program.CheckForUpdate();
         }
 
-        private void mnuMainReportIssue_Click(object sender, EventArgs e)
-        {
-            try
-            {
+        private void mnuMainReportIssue_Click(object sender, EventArgs e) {
+            try {
                 Process.Start("https://github.com/d2phap/ImageGlass/issues");
             }
             catch { }
         }
 
+        private void mnuMainExitApplication_Click(object sender, EventArgs e) {
+            Application.Exit();
+        }
 
-        private void mnuMainStartStopAnimating_Click(object sender, EventArgs e)
-        {
-            if (picMain.IsAnimating)
-            {
+        private void mnuMainStartStopAnimating_Click(object sender, EventArgs e) {
+            if (picMain.IsAnimating) {
                 picMain.StopAnimating();
             }
-            else
-            {
+            else {
                 picMain.StartAnimating();
             }
         }
 
-        private void mnuMain_Opening(object sender, CancelEventArgs e)
-        {
+        private async void mnuMain_Opening(object sender, CancelEventArgs e) {
             btnMenu.Checked = true;
 
-            try
-            {
+            try {
                 // Alert user if there is a new version
-                if (GlobalSetting.IsNewVersionAvailable)
-                {
-                    mnuMainCheckForUpdate.Text = mnuMainCheckForUpdate.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCheckForUpdate._NewVersion"];
-                    mnuMainCheckForUpdate.BackColor = Color.FromArgb(35, 255, 165, 2);
+                if (Configs.IsNewVersionAvailable) {
+                    mnuMainCheckForUpdate.Text = mnuMainCheckForUpdate.Text = Configs.Language.Items[$"{Name}.mnuMainCheckForUpdate._NewVersion"];
+                    mnuMainHelp.BackColor = mnuMainCheckForUpdate.BackColor = Color.FromArgb(35, 255, 165, 2);
                 }
-                else
-                {
-                    mnuMainCheckForUpdate.Text = mnuMainCheckForUpdate.Text = GlobalSetting.LangPack.Items["frmMain.mnuMainCheckForUpdate._NoUpdate"];
+                else {
+                    mnuMainCheckForUpdate.Text = mnuMainCheckForUpdate.Text = Configs.Language.Items[$"{Name}.mnuMainCheckForUpdate._NoUpdate"];
+                    mnuMainHelp.BackColor = mnuMainCheckForUpdate.BackColor = Color.Transparent;
                 }
-                
 
-                mnuMainExtractFrames.Enabled = false;
-                mnuMainStartStopAnimating.Enabled = false;
+                mnuMainExtractPages.Enabled =
+                    mnuMainStartStopAnimating.Enabled =
+                    mnuMainPrevPage.Enabled =
+                    mnuMainNextPage.Enabled =
+                    mnuMainFirstPage.Enabled =
+                    mnuMainLastPage.Enabled = false;
 
+                mnuMainSetAsLockImage.Enabled = true;
 
-                int frameCount = 0;
-                if (GlobalSetting.CurrentIndex >= 0)
-                {
-                    Image img = GlobalSetting.ImageList.GetImage(GlobalSetting.CurrentIndex);
-                    FrameDimension dim = new FrameDimension(img.FrameDimensionsList[0]);
-                    frameCount = img.GetFrameCount(dim);
+                var frameCount = 0;
+                if (Local.CurrentIndex >= 0) {
+                    var imgData = await Local.ImageList.GetImgAsync(Local.CurrentIndex).ConfigureAwait(true);
+                    frameCount = imgData?.PageCount ?? 0;
                 }
-                
 
-                mnuMainExtractFrames.Text = string.Format(GlobalSetting.LangPack.Items["frmMain.mnuMainExtractFrames"], frameCount);
-
-                if (frameCount > 1)
-                {
-                    mnuMainExtractFrames.Enabled = true;
-                    mnuMainStartStopAnimating.Enabled = true;
+                if (frameCount > 1) {
+                    mnuMainExtractPages.Enabled =
+                        mnuMainStartStopAnimating.Enabled =
+                        mnuMainPrevPage.Enabled =
+                        mnuMainNextPage.Enabled =
+                        mnuMainFirstPage.Enabled =
+                        mnuMainLastPage.Enabled = true;
                 }
+
+                mnuMainExtractPages.Text = string.Format(Configs.Language.Items[$"{Name}.mnuMainExtractPages"], frameCount);
 
                 // check if igcmdWin10.exe exists!
-                if (!File.Exists(GlobalSetting.StartUpDir("igcmdWin10.exe")))
-                {
+                if (!_isWindows10 || !File.Exists(App.StartUpDir("igcmdWin10.exe"))) {
                     mnuMainSetAsLockImage.Enabled = false;
                 }
-                else
-                {
-                    mnuMainSetAsLockImage.Enabled = true;
-                }
 
-                // Get association App for editing
-                UpdateEditingAssocAppInfoForMenu();
-                
+                // add hotkey to Exit menu
+                mnuMainExitApplication.ShortcutKeyDisplayString = Configs.IsPressESCToQuit ? "ESC" : "Alt+F4";
+
+                // Get EditApp for editing
+                UpdateEditAppInfoForMenu();
             }
-            catch (Exception) { }
+            catch { }
         }
 
-        private void mnuMain_Closed(object sender, ToolStripDropDownClosedEventArgs e)
-        {
+        private void mnuMain_Closed(object sender, ToolStripDropDownClosedEventArgs e) {
             btnMenu.Checked = false;
         }
 
-
-        private void subMenu_DropDownOpening(object sender, EventArgs e)
-        {
-            ToolStripMenuItem mnuItem = sender as ToolStripMenuItem;
-            if (mnuItem.HasDropDownItems == false)
-            {
+        private void subMenu_DropDownOpening(object sender, EventArgs e) {
+            var mnuItem = sender as ToolStripMenuItem;
+            if (!mnuItem.HasDropDownItems) {
                 return; // not a drop down item
             }
+
+            mnuItem.DropDown.BackColor = Configs.Theme.MenuBackgroundColor;
 
             //get position of current menu item
             var pos = new Point(mnuItem.GetCurrentParent().Left, mnuItem.GetCurrentParent().Top);
 
             // Current bounds of the current monitor
-            Rectangle bounds = Screen.GetWorkingArea(pos);
-            Screen currentScreen = Screen.FromPoint(pos);
+            var currentScreen = Screen.FromPoint(pos);
 
             // Find the width of sub-menu
-            int maxWidth = 0;
-            foreach (var subItem in mnuItem.DropDownItems)
-            {
-                if (subItem is ToolStripMenuItem mnu)
-                {
+            var maxWidth = 0;
+            foreach (var subItem in mnuItem.DropDownItems) {
+                if (subItem is ToolStripMenuItem mnu) {
                     maxWidth = Math.Max(mnu.Width, maxWidth);
                 }
             }
             maxWidth += 10; // Add a little wiggle room
 
-            int farRight = pos.X + mnuMain.Width + maxWidth;
-            int farLeft = pos.X - maxWidth;
-            
-            //get left and right distance to compare
-            int leftGap = farLeft - currentScreen.Bounds.Left;
-            int rightGap = currentScreen.Bounds.Right - farRight;
-            
+            var farRight = pos.X + mnuMain.Width + maxWidth;
+            var farLeft = pos.X - maxWidth;
 
-            if (leftGap >= rightGap)
-            {
+            // get left and right distance to compare
+            var leftGap = farLeft - currentScreen.Bounds.Left;
+            var rightGap = currentScreen.Bounds.Right - farRight;
+
+            if (leftGap >= rightGap) {
                 mnuItem.DropDownDirection = ToolStripDropDownDirection.Left;
             }
-            else
-            {
+            else {
                 mnuItem.DropDownDirection = ToolStripDropDownDirection.Right;
             }
-
-
-            mnuItem.DropDown.BackColor = LocalSetting.Theme.MenuBackgroundColor;
         }
 
 
-
-
-
-
-
-
-
         #endregion
-
-        
     }
 }

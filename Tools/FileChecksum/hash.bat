@@ -1,11 +1,11 @@
-fciv -both -add "../../Setup/MSI/x64/ImageGlass_6.0.12.29_x64.msi"
+fciv -sha1 -add "../../Setup/AdvancedInstaller/Bin/ImageGlass_8.0.12.8_x64.msi"
 
 
-fciv -both -add "../../Setup/MSI/x86/ImageGlass_6.0.12.29_x86.msi"
+@REM fciv -sha1 -add "../../Setup/AdvancedInstaller/Bin/ImageGlass_8.0.12.8_x86.msi"
 
 
-fciv -both -add "../../Setup/ImageGlass_6.0.12.29.exe"
+fciv -sha1 -add "../../Setup/AdvancedInstaller/Bin/ImageGlass_8.0.12.8_x64.zip"
 
 
-fciv -both -add "../../Setup/ImageGlass_6.0.12.29.zip"
+@REM fciv -sha1 -add "../../Setup/AdvancedInstaller/Bin/ImageGlass_8.0.12.8_x86.zip"
 pause

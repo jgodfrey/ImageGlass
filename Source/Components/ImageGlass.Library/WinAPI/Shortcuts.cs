@@ -1,7 +1,7 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
 Copyright (C) 2018 DUONG DIEU PHAP
-Project homepage: http://imageglass.org
+Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -23,17 +23,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * https://astoundingprogramming.wordpress.com/2012/12/17/how-to-get-the-target-of-a-windows-shortcut-c/
  ********************************/
 
-namespace ImageGlass.Library.WinAPI
-{
-    public static class Shortcuts
-    {
-        public static string FolderFromShortcut(string fileLink)
-        {
-            IWshRuntimeLibrary.WshShell shell = new IWshRuntimeLibrary.WshShell();
+namespace ImageGlass.Library.WinAPI {
+    public static class Shortcuts {
+        /// <summary>
+        /// Get the target path from shortcut (*.lnk)
+        /// </summary>
+        /// <param name="shortcutPath">Path of shortcut (*.lnk)</param>
+        /// <returns></returns>
+        public static string GetTargetPathFromShortcut(string shortcutPath) {
+            var shell = new IWshRuntimeLibrary.WshShell();
 
-            try
-            {
-                IWshRuntimeLibrary.IWshShortcut shortcut = (IWshRuntimeLibrary.IWshShortcut)shell.CreateShortcut(fileLink);
+            try {
+                var shortcut = (IWshRuntimeLibrary.IWshShortcut)shell.CreateShortcut(shortcutPath);
                 return shortcut.TargetPath;
             }
             catch //(COMException)

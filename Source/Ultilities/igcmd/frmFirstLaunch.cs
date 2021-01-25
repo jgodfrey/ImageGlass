@@ -1,6 +1,6 @@
 ﻿/*
 ImageGlass Project - Image viewer for Windows
-Copyright (C) 2019 DUONG DIEU PHAP
+Copyright (C) 2021 DUONG DIEU PHAP
 Project homepage: https://imageglass.org
 
 This program is free software: you can redistribute it and/or modify
@@ -17,143 +17,144 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-
-using ImageGlass.Services.Configuration;
+using ImageGlass.Base;
+using ImageGlass.Library;
+using ImageGlass.Library.WinAPI;
+using ImageGlass.Settings;
+using ImageGlass.UI;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Windows.Forms;
-using ImageGlass.Library;
-using ImageGlass.Theme;
 
-namespace igcmd
-{
-    public partial class frmFirstLaunch : Form
-    {
-        public frmFirstLaunch()
-        {
+namespace igcmd {
+    public partial class frmFirstLaunch: Form {
+        public frmFirstLaunch() {
             InitializeComponent();
 
+            // Extract & install Theme packs
+            InstallThemePacks();
+            LoadThemeList();
+
+            // first apply current theme
+            ApplyTheme(Configs.Theme);
         }
 
-        private List<Theme> _themeList = new List<Theme>();
+        private readonly List<Theme> _themeList = new List<Theme>();
         private List<Language> _langList = new List<Language>();
 
         private Language _lang = new Language();
-        private Theme _theme = new Theme();
+        private Theme _theme = new Theme((int)Configs.ToolbarIconHeight);
         private LayoutMode _layout = LayoutMode.Standard;
 
+        #region Form events
 
-        #region Events
-
-        private void frmFirstLaunch_Load(object sender, EventArgs e)
-        {
-            //Load language list
+        private void frmFirstLaunch_Load(object sender, EventArgs e) {
+            // Load language list
             LoadLanguageList();
             ApplyLanguage(_lang);
 
-            //Extract & install Theme packs
-            InstallThemePacks();
-
-            //Load theme list
-            LoadThemeList();
-
-
-            //Don't run again
-            GlobalSetting.SetConfig("FirstLaunchVersion", GlobalSetting.FIRST_LAUNCH_VERSION.ToString());
+            // Don't run again
+            Configs.FirstLaunchVersion = Constants.FIRST_LAUNCH_VERSION;
         }
 
+        private void tab1_SelectedIndexChanged(object sender, EventArgs e) {
+            lblStepNumber.Text = string.Format(this._lang.Items[$"{Name}.lblStepNumber"], tab1.SelectedIndex + 1, tab1.TabCount);
 
-        private void tab1_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            lblStepNumber.Text = string.Format(this._lang.Items[$"{this.Name}.lblStepNumber"], tab1.SelectedIndex + 1, tab1.TabCount);
-
-
-            if (tab1.SelectedIndex == tab1.TabCount - 1)
-            {
-                btnNextStep.Text = this._lang.Items[$"{this.Name}.btnNextStep._Done"];
+            if (tab1.SelectedIndex == tab1.TabCount - 1) {
+                btnNextStep.Text = _lang.Items[$"{Name}.btnNextStep._Done"];
             }
-            else
-            {
-                btnNextStep.Text = this._lang.Items[$"{this.Name}.btnNextStep"];
+            else {
+                btnNextStep.Text = _lang.Items[$"{Name}.btnNextStep"];
             }
         }
 
-
-        private void btnNextStep_Click(object sender, EventArgs e)
-        {
-            //Done all configs, apply settings and launch ImageGlass
-            if (tab1.SelectedIndex == tab1.TabCount - 1)
-            {
+        private void btnNextStep_Click(object sender, EventArgs e) {
+            // Done all configs, apply settings and launch ImageGlass
+            if (tab1.SelectedIndex == tab1.TabCount - 1) {
                 ApplySettings();
 
-                LaunchImageGlass();
+                // Get all processes of ImageGlass
+                var igProcesses = Process.GetProcesses()
+                    .Where(p =>
+                        p.Id != Process.GetCurrentProcess().Id &&
+                        p.ProcessName.Contains("ImageGlass")
+                    )
+                    .ToList();
+
+                if (igProcesses.Count > 0) {
+                    var result = MessageBox.Show(this._lang.Items[$"{Name}._ConfirmCloseProcess"], "", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+                    if (result == DialogResult.Yes) {
+                        // Kill all processes
+                        igProcesses.ForEach(p => p.Kill());
+
+                        LaunchImageGlass();
+                    }
+                }
+                else {
+                    LaunchImageGlass();
+                }
+
                 this.Close();
+
+                return;
             }
 
             tab1.SelectedIndex++;
             lblStepNumber.Text = string.Format(this._lang.Items[$"{this.Name}.lblStepNumber"], tab1.SelectedIndex + 1, tab1.TabCount);
 
-            //Done
-            if (tab1.SelectedIndex == tab1.TabCount - 1)
-            {
+            // Done
+            if (tab1.SelectedIndex == tab1.TabCount - 1) {
                 btnNextStep.Text = this._lang.Items[$"{this.Name}.btnNextStep._Done"];
             }
-            //Next Step
-            else
-            {
+            // Next Step
+            else {
                 btnNextStep.Text = this._lang.Items[$"{this.Name}.btnNextStep"];
             }
         }
 
+        private void lnkSkip_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e) {
+            // Save configs to file
+            Configs.Write();
 
-        private void lnkSkip_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
-        {
             LaunchImageGlass();
             this.Close();
         }
 
-
-        private void btnSetDefaultApp_Click(object sender, EventArgs e)
-        {
-            GlobalSetting.LoadBuiltInImageFormats();
-
-
+        private void btnSetDefaultApp_Click(object sender, EventArgs e) {
             // Update extensions to registry
-            Process p = new Process();
-            p.StartInfo.FileName = GlobalSetting.StartUpDir("igtasks.exe");
-            p.StartInfo.Arguments = $"regassociations {GlobalSetting.AllImageFormats}";
+            using (var p = new Process()) {
+                var formats = Configs.GetImageFormats(Configs.AllFormats);
 
-            try
-            {
-                p.Start();
+                p.StartInfo.FileName = App.StartUpDir("igtasks.exe");
+                p.StartInfo.Arguments = $"regassociations {formats}";
+
+                try {
+                    p.Start();
+                }
+                catch { }
             }
-            catch { }
         }
 
-
-        private void cmbLanguage_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            try
-            {
+        private void cmbLanguage_SelectedIndexChanged(object sender, EventArgs e) {
+            try {
                 this._lang = _langList[cmbLanguage.SelectedIndex];
             }
-            catch
-            {
+            catch {
                 this._lang = new Language();
             }
 
             ApplyLanguage(this._lang);
         }
 
-
-        private void cmbTheme_SelectedIndexChanged(object sender, EventArgs e)
-        {
+        private void cmbTheme_SelectedIndexChanged(object sender, EventArgs e) {
             var selectedTheme = new Theme();
 
-            try
-            {
+            try {
                 selectedTheme = this._themeList[cmbTheme.SelectedIndex];
             }
             catch { }
@@ -162,67 +163,55 @@ namespace igcmd
             _theme = selectedTheme;
         }
 
-
-        private void cmbLayout_SelectedIndexChanged(object sender, EventArgs e)
-        {
+        private void cmbLayout_SelectedIndexChanged(object sender, EventArgs e) {
             _layout = (LayoutMode)cmbLayout.SelectedIndex;
         }
 
         #endregion
 
-
-
         #region Private Functions
+
         /// <summary>
         /// Load language list
         /// </summary>
-        private void LoadLanguageList()
-        {
+        private void LoadLanguageList() {
             cmbLanguage.Items.Clear();
             cmbLanguage.Items.Add("English");
-
 
             _langList = new List<Language>
             {
                 new Language()
             };
 
-            string langPath = GlobalSetting.StartUpDir(Dir.Languages);
+            var langPath = App.StartUpDir(Dir.Languages);
 
-            if (Directory.Exists(langPath))
-            {
-                foreach (string f in Directory.GetFiles(langPath))
-                {
-                    if (Path.GetExtension(f).ToLower() == ".iglang")
-                    {
-                        Language l = new Language(f);
-                        _langList.Add(l);
+            if (Directory.Exists(langPath)) {
+                foreach (var f in Directory.GetFiles(langPath)) {
+                    if (string.Equals(Path.GetExtension(f), ".iglang", StringComparison.CurrentCultureIgnoreCase)) {
+                        var lang = new Language(f);
+                        _langList.Add(lang);
 
-                        int iLang = cmbLanguage.Items.Add(l.LangName);
-                        string curLang = GlobalSetting.GetConfig("Language", "English");
+                        var iLang = cmbLanguage.Items.Add(lang.LangName);
+                        var curLang = Configs.Language.LangName;
 
-                        //using current language pack
-                        if (f.CompareTo(curLang) == 0)
-                        {
+                        // using current language pack
+                        if (f.CompareTo(curLang) == 0) {
                             cmbLanguage.SelectedIndex = iLang;
                         }
                     }
                 }
             }
 
-            if (cmbLanguage.SelectedIndex == -1)
-            {
+            if (cmbLanguage.SelectedIndex == -1) {
                 cmbLanguage.SelectedIndex = 0;
             }
         }
-
 
         /// <summary>
         /// Apply language
         /// </summary>
         /// <param name="lang"></param>
-        private void ApplyLanguage(Language lang)
-        {
+        private void ApplyLanguage(Language lang) {
             this._lang = lang;
 
             this.Text = _lang.Items[$"{this.Name}._Text"];
@@ -239,80 +228,38 @@ namespace igcmd
             LoadLayoutList();
         }
 
-
         /// <summary>
         /// Launch ImageGlass app
         /// </summary>
-        private void LaunchImageGlass()
-        {
-            var appExe = GlobalSetting.StartUpDir("ImageGlass.exe");
-
-            Process p = new Process();
-            p.StartInfo.FileName = Path.Combine(appExe);
+        private void LaunchImageGlass() {
+            var p = new Process();
+            p.StartInfo.FileName = Path.Combine(App.IGExePath);
             p.Start();
         }
-
 
         /// <summary>
         /// Load theme list
         /// </summary>
-        private void LoadThemeList()
-        {
-            //add default theme
-            var defaultTheme = new Theme(GlobalSetting.StartUpDir(@"DefaultTheme\config.xml"));
-            _themeList.Add(defaultTheme);
+        private void LoadThemeList() {
             cmbTheme.Items.Clear();
-            cmbTheme.Items.Add(defaultTheme.Name);
-            cmbTheme.SelectedIndex = 0;
 
+            _themeList.Clear();
+            _themeList.AddRange(Theme.GetAllThemePacks());
 
-            string themeFolder = GlobalSetting.ConfigDir(Dir.Themes);
+            foreach (var th in _themeList) {
+                cmbTheme.Items.Add(th.Name);
 
-            //get the current theme
-            var currentTheme = GlobalSetting.GetConfig("Theme", "default");
-
-
-            if (Directory.Exists(themeFolder))
-            {
-                foreach (string d in Directory.GetDirectories(themeFolder))
-                {
-                    string configFile = Path.Combine(d, "config.xml");
-
-                    if (File.Exists(configFile))
-                    {
-                        Theme th = new Theme(d);
-
-                        //invalid theme
-                        if (!th.IsThemeValid)
-                        {
-                            continue;
-                        }
-
-                        _themeList.Add(th);
-                        cmbTheme.Items.Add(th.Name);
-
-                        if (currentTheme.ToLower().CompareTo(th.ThemeFolderName.ToLower()) == 0)
-                        {
-                            cmbTheme.SelectedIndex = cmbTheme.Items.Count - 1;
-                        }
-                    }
+                if (Configs.Theme.FolderName.ToUpper().CompareTo(th.FolderName.ToUpper()) == 0) {
+                    cmbTheme.SelectedIndex = cmbTheme.Items.Count - 1;
                 }
             }
-            else
-            {
-                Directory.CreateDirectory(themeFolder);
-            }
-
-
         }
-
 
         /// <summary>
         /// Apply theme
         /// </summary>
         /// <param name="th"></param>
-        private void ApplyTheme(Theme th)
-        {
+        private void ApplyTheme(Theme th) {
             panFooter.BackColor = th.ToolbarBackgroundColor;
             panHeader.BackColor =
                 tabLanguage.BackColor =
@@ -321,86 +268,76 @@ namespace igcmd
                 tabFileAssociation.BackColor =
                 th.BackgroundColor;
 
-            lblStepNumber.ForeColor =
-                lblLanguage.ForeColor =
-                lblLayout.ForeColor =
-                lblTheme.ForeColor =
-                lblDefaultApp.ForeColor =
+            this.lblStepNumber.ForeColor =
+                this.lblLanguage.ForeColor =
+                this.lblLayout.ForeColor =
+                this.lblTheme.ForeColor =
+                this.lblDefaultApp.ForeColor =
                 Theme.InvertBlackAndWhiteColor(th.BackgroundColor);
 
-        }
+            // Logo
+            picLogo.Image = th.Logo.Image;
 
+            // apply form theme
+            Configs.ApplyFormTheme(this, th);
+        }
 
         /// <summary>
         /// Extract and install theme packs
         /// </summary>
-        private void InstallThemePacks()
-        {
-            var themeFiles = Directory.GetFiles(GlobalSetting.StartUpDir("DefaultTheme"), "*.igtheme");
+        private void InstallThemePacks() {
+            var themeFiles = Directory.GetFiles(App.StartUpDir(Dir.Themes), "*.igtheme");
 
-            foreach (var file in themeFiles)
-            {
+            foreach (var file in themeFiles) {
                 Theme.InstallTheme(file);
             }
         }
 
-
         /// <summary>
         /// Load layout list
         /// </summary>
-        private void LoadLayoutList()
-        {
+        private void LoadLayoutList() {
             cmbLayout.Items.Clear();
             var list = Enum.GetNames(typeof(LayoutMode));
 
-            foreach (var item in list)
-            {
+            foreach (var item in list) {
                 cmbLayout.Items.Add(_lang.Items[$"{this.Name}.cmbLayout._{item}"]);
             }
 
             cmbLayout.SelectedIndex = 0;
         }
 
-
         /// <summary>
         /// Save and apply settings
         /// </summary>
-        private void ApplySettings()
-        {
-            GlobalSetting.SetConfig("Language", Path.GetFileName(_lang.FileName));
-            GlobalSetting.SetConfig("Theme", _theme.ThemeFolderName);
+        private void ApplySettings() {
+            Configs.Language = this._lang;
+            Configs.Theme = this._theme;
+            Configs.BackgroundColor = this._theme.BackgroundColor;
 
+            if (_layout == LayoutMode.Designer) {
+                Configs.MouseWheelAction = MouseWheelActions.ScrollVertically;
+                Configs.MouseWheelCtrlAction = MouseWheelActions.Zoom;
+                Configs.MouseWheelShiftAction = MouseWheelActions.ScrollHorizontally;
+                Configs.MouseWheelAltAction = MouseWheelActions.DoNothing;
 
-            if (_layout == LayoutMode.Designer)
-            {
-                GlobalSetting.SetConfig("ToolbarButtons", GlobalSetting.ToolbarButtons);
-
-                GlobalSetting.SetConfig("MouseWheelAction", ((int)MouseWheelActions.ScrollVertically).ToString());
-                GlobalSetting.SetConfig("MouseWheelCtrlAction", ((int)MouseWheelActions.Zoom).ToString());
-                GlobalSetting.SetConfig("MouseWheelShiftAction", ((int)MouseWheelActions.ScrollHorizontally).ToString());
-                GlobalSetting.SetConfig("MouseWheelAltAction", ((int)MouseWheelActions.DoNothing).ToString());
-
-                GlobalSetting.SetConfig("ZoomLockValue", "100"); //lock zoom at 100%
-                GlobalSetting.SetConfig("IsShowColorPickerOnStartup", "True");
+                Configs.ZoomLockValue = 100f;
+                Configs.IsShowColorPickerOnStartup = true;
             }
-            else
-            {
-                GlobalSetting.SetConfig("ToolbarButtons", GlobalSetting.ToolbarButtons);
+            else {
+                Configs.MouseWheelAction = MouseWheelActions.Zoom;
+                Configs.MouseWheelCtrlAction = MouseWheelActions.ScrollVertically;
+                Configs.MouseWheelShiftAction = MouseWheelActions.ScrollHorizontally;
+                Configs.MouseWheelAltAction = MouseWheelActions.DoNothing;
 
-                GlobalSetting.SetConfig("MouseWheelAction", ((int)MouseWheelActions.Zoom).ToString());
-                GlobalSetting.SetConfig("MouseWheelCtrlAction", ((int)MouseWheelActions.ScrollVertically).ToString());
-                GlobalSetting.SetConfig("MouseWheelShiftAction", ((int)MouseWheelActions.ScrollHorizontally).ToString());
-                GlobalSetting.SetConfig("MouseWheelAltAction", ((int)MouseWheelActions.DoNothing).ToString());
-
-                GlobalSetting.SetConfig("ZoomLockValue", "-1"); //do not lock zoom
+                Configs.ZoomLockValue = -1f;
             }
 
+            // Save configs to file
+            Configs.Write();
         }
 
-
-
         #endregion
-
 
     }
 }
